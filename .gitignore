@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+ENV/
+
+# --- Secrets & credentials ---
+.env
+.env.*
+!.env.example
+*-service-account.json
+service-account*.json
+*credentials*.json
+*.pem
+*.key
+
+# --- Generated media (HLS segments, playlists, captures) ---
+media/
+frames/
+# NOTE: HLS segments use .ts, which collides with TypeScript sources. These
+# patterns are scoped to media dirs so a future web dashboard is not swallowed.
+media/**/*.ts
+**/segments/*.ts
+*.m4s
+*.m3u8
+*.mp4
+
+# --- AI tooling artifacts (kept out of the judged repo) ---
+.claude/
+CLAUDE.md
+.cursor/
+.cursorrules
+.aider*
+.gemini/
+
+# --- OS ---
+.DS_Store

@@ -1,0 +1,9 @@
+google-adk
+google-genai
+# Pinned: google-adk requires mcp>=1.24,<2. Bare `mcp` resolves to 2.0.0, which
+# drops mcp.shared.session and breaks `from google.adk.tools.mcp_tool import
+# McpToolset` -- the ADK swallows the ImportError, so the toolset just silently
+# vanishes rather than failing loudly.
+mcp>=1.24,<2
+python-dotenv
+httpx
