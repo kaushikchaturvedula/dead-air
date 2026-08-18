@@ -12,6 +12,9 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
+# --- ADK runtime state (session/artifact storage written next to agents) ---
+.adk/
+
 # --- Virtualenvs ---
 .venv/
 venv/

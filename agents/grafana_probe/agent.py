@@ -1,7 +1,7 @@
-"""Grafana Cloud MCP probe agent.
+"""Grafana MCP probe agent.
 
-This agent does one job: prove that we can reach the Grafana Cloud MCP server
-and enumerate every tool it exposes. It is deliberately dumb -- no remediation
+This agent does one job: prove that we can reach the (self-hosted) Grafana MCP
+server and enumerate every tool it exposes. It is deliberately dumb -- no remediation
 logic, no video inspection, no dashboard annotation. Those belong to the DEAD
 AIR operations agent proper, which is built on top of the tool inventory this
 probe produces.
@@ -18,13 +18,25 @@ from google.adk.tools.mcp_tool.mcp_session_manager import (
     StreamableHTTPConnectionParams,
 )
 
-# Grafana Cloud's hosted MCP endpoint. Streamable HTTP only -- this endpoint
-# does not serve the older SSE transport, so SseConnectionParams will not work.
-GRAFANA_MCP_URL = "https://mcp.grafana.com/mcp"
+# Self-hosted Grafana MCP server (grafana/mcp-grafana via docker-compose.yml),
+# speaking streamable HTTP. We do NOT use Grafana's hosted mcp.grafana.com
+# endpoint: it requires an interactive OAuth 2.1 browser handshake with no
+# service-account option, so it cannot back a headless agent woken by an alert
+# webhook. The self-hosted server authenticates to the Grafana stack itself
+# (GRAFANA_URL + GRAFANA_SERVICE_ACCOUNT_TOKEN in its environment), so the
+# client connection here needs no auth headers.
+GRAFANA_MCP_URL = os.environ.get("GRAFANA_MCP_URL", "http://localhost:8010/mcp")
 
-# Which Grafana stack the hosted MCP server should act against, e.g.
-# https://deadair.grafana.net -- passed per-request as a header.
-GRAFANA_STACK_URL = os.environ.get("GRAFANA_STACK_URL", "")
+# Optional caller-auth bearer token for the MCP server itself (not the Grafana
+# stack). mcp-grafana warns at startup that serving without one "will become a
+# startup error in a future release" -- if you set MCP_GRAFANA_SERVER_TOKEN in
+# .env, docker-compose passes it to the server and this client presents it.
+_MCP_SERVER_TOKEN = os.environ.get("MCP_GRAFANA_SERVER_TOKEN", "")
+
+# Gemini 3.x flash models are served from the `global` Vertex location only;
+# us-central1 tops out at gemini-2.5-flash. Note that the `gemini-flash-latest`
+# alias is AI Studio-only and 404s on Vertex, so it is not a safe default here.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 
 INSTRUCTION = """\
 You are a read-only observability probe for the DEAD AIR project. You are
@@ -56,7 +68,7 @@ than an admission of ignorance.
 # breaks when the agent is deployed to Cloud Run or Agent Engine.
 root_agent = Agent(
     name="grafana_probe",
-    model="gemini-flash-latest",
+    model=GEMINI_MODEL,
     description=(
         "Read-only probe that connects to the Grafana Cloud MCP server and "
         "enumerates the tools it exposes."
@@ -66,7 +78,11 @@ root_agent = Agent(
         McpToolset(
             connection_params=StreamableHTTPConnectionParams(
                 url=GRAFANA_MCP_URL,
-                headers={"X-Grafana-URL": GRAFANA_STACK_URL},
+                headers=(
+                    {"Authorization": f"Bearer {_MCP_SERVER_TOKEN}"}
+                    if _MCP_SERVER_TOKEN
+                    else None
+                ),
             ),
             # No tool_filter: the whole point of this agent is to see
             # everything the MCP server offers.

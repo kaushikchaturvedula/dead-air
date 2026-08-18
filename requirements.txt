@@ -1,3 +1,5 @@
+# Python deps only. The Grafana MCP server (grafana/mcp-grafana) is a separate
+# runtime dependency, run self-hosted via Docker -- see docker-compose.yml.
 google-adk
 google-genai
 # Pinned: google-adk requires mcp>=1.24,<2. Bare `mcp` resolves to 2.0.0, which

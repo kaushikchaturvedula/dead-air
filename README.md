@@ -27,8 +27,9 @@ delivered pixels, so a healthy-looking pipeline carrying dead air gets caught.
 When viewer quality-of-experience degrades, a [Google ADK](https://google.github.io/adk-docs/)
 agent powered by Gemini:
 
-1. **Queries Grafana Cloud** through the Grafana MCP server, across metrics,
-   logs, and traces.
+1. **Queries Grafana Cloud** through a self-hosted [Grafana MCP
+   server](https://github.com/grafana/mcp-grafana), across metrics, logs, and
+   traces.
 2. **Pulls the actual video segment** being delivered to viewers.
 3. **Inspects the frame with Gemini vision** — catching black frames, frozen
    sources, and other content failures that delivery telemetry reports as
@@ -47,6 +48,9 @@ agent powered by Gemini:
                     │  metrics · logs · traces
                     ▼
              Grafana Cloud
+                    │
+                    ▼
+      grafana/mcp-grafana  (self-hosted, Docker)
                     │  MCP (streamable HTTP)
                     ▼
               ADK agent  ──▶  Gemini vision on delivered segments
@@ -62,15 +66,23 @@ Google Cloud AI tooling only, by contest rule.
 | --- | --- |
 | Agent framework | Google ADK (`google-adk`) |
 | Model | Gemini via Vertex AI (`google-genai`) |
-| Observability | Grafana Cloud + Grafana MCP server |
+| Observability | Grafana Cloud |
+| MCP server | [grafana/mcp-grafana](https://github.com/grafana/mcp-grafana), self-hosted via Docker |
 | Tool transport | MCP over streamable HTTP |
 
 No LangChain, no LangGraph, no non-Google agent framework, and no OpenAI,
 Anthropic, HuggingFace, or Whisper models anywhere in the project.
 
+The MCP server is self-hosted rather than Grafana's hosted `mcp.grafana.com`
+endpoint deliberately: the hosted endpoint only authenticates through an
+interactive OAuth 2.1 browser handshake, which a headless agent woken by an
+alert webhook can never complete. Self-hosting authenticates with a Grafana
+service-account token instead.
+
 ## Setup
 
-Requires Python 3.10+ and a Google Cloud project with Vertex AI enabled.
+Requires Python 3.10+, Docker, and a Google Cloud project with Vertex AI
+enabled.
 
 ```bash
 git clone https://github.com/kaushikchaturvedula/dead-air.git
@@ -81,9 +93,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp agents/grafana_probe/.env.example agents/grafana_probe/.env
-# then edit .env and set GOOGLE_CLOUD_PROJECT
+# then edit .env: set GOOGLE_CLOUD_PROJECT and GRAFANA_SERVICE_ACCOUNT_TOKEN
+# (a Grafana service-account token -- create one in your Grafana stack under
+#  Administration > Users and access > Service accounts)
 
 gcloud auth application-default login
+
+# start the self-hosted Grafana MCP server on localhost:8010
+docker compose up -d mcp-grafana
 ```
 
 Run the Grafana MCP connectivity probe:
@@ -93,9 +110,9 @@ cd agents
 adk web
 ```
 
-Open the URL it prints, pick the `grafana_probe` agent, and send a message. The
-first tool call triggers a Grafana OAuth handshake in your browser; approve it,
-and the agent can then query your stack.
+Open the URL it prints, pick the `grafana_probe` agent, and ask it about your
+stack. The MCP server authenticates to Grafana with the service-account token —
+no browser handshake involved.
 
 The tools the MCP server exposes are catalogued in
 [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md).

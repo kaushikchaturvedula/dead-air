@@ -1,0 +1,40 @@
+# DEAD AIR -- local observability tooling.
+#
+# Runs the Grafana MCP server (github.com/grafana/mcp-grafana) self-hosted in
+# streamable-http mode. The hosted endpoint at mcp.grafana.com requires an
+# interactive OAuth 2.1 browser handshake and has no service-account option,
+# which rules it out for a headless agent woken by an alert webhook -- so DEAD
+# AIR runs its own.
+#
+# Setup from a clean clone:
+#   cp agents/grafana_probe/.env.example agents/grafana_probe/.env
+#   # fill in GRAFANA_SERVICE_ACCOUNT_TOKEN (and your stack's GRAFANA_URL)
+#   docker compose up -d mcp-grafana
+
+services:
+  mcp-grafana:
+    # Verified working 2026-08-17 at
+    # sha256:f21a19cebbfa7c3a76ef1746171e5ffc3601064e432f593e7c6cb526e5216e5f
+    # (upstream publishes no semver tags). Pin that digest if latest breaks.
+    image: grafana/mcp-grafana:latest
+    container_name: deadair-mcp-grafana
+    # -address: listen on 8010 inside the container so it matches the host
+    #   port 1:1. The server validates the Host header against its listen port
+    #   (DNS-rebinding protection), so a remapped port (e.g. 8010->8000) makes
+    #   every request 403.
+    # -allowed-hosts: explicit, covering both spellings of loopback.
+    command:
+      [
+        "-t", "streamable-http",
+        "-address", "0.0.0.0:8010",
+        "-allowed-hosts", "localhost:8010,127.0.0.1:8010",
+      ]
+    # Reads GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN. The file is
+    # gitignored; compose fails loudly here if you haven't created it.
+    env_file:
+      - agents/grafana_probe/.env
+    ports:
+      # 8010 because `adk web` owns host port 8000. Bound to localhost so the
+      # token-holding server is never reachable from the LAN.
+      - "127.0.0.1:8010:8010"
+    restart: unless-stopped
