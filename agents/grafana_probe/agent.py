@@ -70,8 +70,8 @@ root_agent = Agent(
     name="grafana_probe",
     model=GEMINI_MODEL,
     description=(
-        "Read-only probe that connects to the Grafana Cloud MCP server and "
-        "enumerates the tools it exposes."
+        "Read-only probe that connects to the self-hosted Grafana MCP server "
+        "and enumerates the tools it exposes."
     ),
     instruction=INSTRUCTION,
     tools=[

@@ -117,6 +117,43 @@ no browser handshake involved.
 The tools the MCP server exposes are catalogued in
 [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md).
 
+## The plant
+
+The plant is the streaming system DEAD AIR observes. It is built bottom-up as a
+telemetry pipe first, video second — there is no point rendering pixels into a
+pipe that cannot carry a number.
+
+**Step 1 — telemetry pipe (working).** A synthetic emitter feeds Grafana Alloy,
+which remote-writes to Grafana Cloud Mimir, where a dashboard panel and an alert
+rule watch it. Crossing the threshold turns Grafana red and delivers a webhook
+to a local receiver — the same trigger that will later wake the agent.
+
+```bash
+make plant-up                # emitter + Alloy + webhook receiver + MCP server
+make tunnel                  # (separate shell) expose the webhook publicly
+make provision               # dashboard + alert rule + contact point
+make verify                  # assert every hop of the pipe is delivering
+make set VALUE=95            # cross the threshold -> Grafana goes red
+make watch                   # see the alert delivery arrive
+make set VALUE=10            # back to healthy -> resolved delivery
+```
+
+`make verify` checks each hop in order and stops at the first break, so a
+failure names the broken hop instead of just reporting "no data".
+
+**Cardinality.** The stack is on the Grafana Cloud free tier (~10k active
+series), and a streaming plant is the classic way to blow that budget: one
+series per viewer session, per request, or per 4-second segment multiplies every
+metric by the number of live viewers. The collector strips those labels before
+remote_write ([plant/alloy/config.alloy](plant/alloy/config.alloy)) — aggregate
+the dimension, don't label by it. The emitter publishes a deliberate canary
+series tagged `session_id` so `make verify` proves the guard is still stripping
+rather than merely asserting the label is absent.
+
+**Step 2 — L1 encoder (next).** ffmpeg generating a 4-rung ABR HLS ladder with
+burned-in timecode, served by an nginx origin, exporting encoder health metrics
+through the Step 1 pipe.
+
 ## License
 
 [Apache-2.0](LICENSE)

@@ -1,0 +1,101 @@
+// DEAD AIR -- Grafana Alloy collector config.
+//
+// Pipeline:  plant targets  ->  scrape  ->  cardinality guard  ->  Grafana Cloud Mimir
+//
+// The cardinality guard is deliberately in this FIRST version of the config
+// rather than retrofitted later. We are on the Grafana Cloud free tier
+// (~10k active series). Per-session and per-request labels are the classic way
+// a streaming plant blows that budget: one series per viewer session, per
+// segment, or per request multiplies every metric by the number of live
+// viewers. Those labels are dropped here, at the collector, so they never
+// reach Mimir and never count toward the limit.
+//
+// Aggregate the dimension instead of labelling by it: count sessions in a
+// gauge, don't emit a series per session.
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ---------------------------------------------------------------------------
+// Targets
+// ---------------------------------------------------------------------------
+// Step 1: the synthetic emitter only. L1 (encoder), L2 (edges) and L3 (viewer
+// fleet) get appended here as they come online -- each as another target with
+// a `layer` label so dashboards can slice by plant layer.
+
+prometheus.scrape "plant" {
+  targets = [
+    {
+      __address__ = "emitter:9101",
+      job         = "deadair-plant",
+      layer       = "L0-synthetic",
+      component   = "emitter",
+    },
+  ]
+
+  forward_to      = [prometheus.relabel.cardinality_guard.receiver]
+  scrape_interval = "15s"
+  scrape_timeout  = "10s"
+}
+
+// ---------------------------------------------------------------------------
+// Cardinality guard
+// ---------------------------------------------------------------------------
+
+prometheus.relabel "cardinality_guard" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+
+  // Drop unbounded per-entity labels before remote_write. `labeldrop` matches
+  // on LABEL NAMES; the regex must be a full-string match.
+  //
+  //   session_id / viewer_id / client_id  -- one value per live viewer (L3)
+  //   request_id / trace_id / span_id     -- one value per request
+  //   segment_uri / segment_id / media_seq -- one value per 4s HLS segment,
+  //                                          i.e. unbounded over time
+  //   instance_ip / pod_ip                -- churns on every restart
+  rule {
+    action = "labeldrop"
+    regex  = "session_id|viewer_id|client_id|request_id|trace_id|span_id|segment_uri|segment_id|media_seq|instance_ip|pod_ip"
+  }
+
+  // Alloy adds `instance` from __address__ (e.g. "emitter:9101"). Harmless in a
+  // fixed local plant, but on GCE it becomes per-VM churn, so pin it to the
+  // stable component name now rather than discovering the churn later.
+  rule {
+    action        = "replace"
+    source_labels = ["component"]
+    target_label  = "instance"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Grafana Cloud Mimir
+// ---------------------------------------------------------------------------
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_MIMIR_URL")
+
+    basic_auth {
+      username = sys.env("GRAFANA_MIMIR_USER")
+      password = sys.env("GRAFANA_CLOUD_METRICS_TOKEN")
+    }
+
+    // Small plant, free tier: keep batches modest so a burst of new series
+    // surfaces as a visible 429 rather than a silent stall.
+    queue_config {
+      capacity             = 2500
+      max_shards           = 3
+      max_samples_per_send = 500
+    }
+  }
+
+  // `cluster` and `env` are added at write time so every DEAD AIR series is
+  // attributable, without each exporter having to know where it runs.
+  external_labels = {
+    project = "dead-air",
+    env     = sys.env("DEADAIR_ENV"),
+  }
+}

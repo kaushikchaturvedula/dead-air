@@ -1,15 +1,17 @@
-# DEAD AIR -- local observability tooling.
+# DEAD AIR -- local plant and observability tooling.
 #
-# Runs the Grafana MCP server (github.com/grafana/mcp-grafana) self-hosted in
-# streamable-http mode. The hosted endpoint at mcp.grafana.com requires an
-# interactive OAuth 2.1 browser handshake and has no service-account option,
-# which rules it out for a headless agent woken by an alert webhook -- so DEAD
-# AIR runs its own.
+# Services:
+#   mcp-grafana  Grafana MCP server, self-hosted (the agent's tool surface)
+#   emitter      synthetic metrics source, Step 1 of the plant
+#   alloy        Grafana Alloy collector -> Grafana Cloud Mimir
+#   webhook      local alert receiver (stand-in for the agent trigger)
+#
+# Everything runs locally. Nothing here needs GCE or Cloud Run.
 #
 # Setup from a clean clone:
 #   cp agents/grafana_probe/.env.example agents/grafana_probe/.env
-#   # fill in GRAFANA_SERVICE_ACCOUNT_TOKEN (and your stack's GRAFANA_URL)
-#   docker compose up -d mcp-grafana
+#   # fill in the token values, then:
+#   make plant-up
 
 services:
   mcp-grafana:
@@ -38,3 +40,46 @@ services:
       # token-holding server is never reachable from the LAN.
       - "127.0.0.1:8010:8010"
     restart: unless-stopped
+
+  # --- Step 1a: synthetic metrics source -------------------------------------
+  emitter:
+    build: ./plant/emitter
+    container_name: deadair-emitter
+    ports:
+      # Exposed so `make set VALUE=n` can drive it from the host.
+      - "127.0.0.1:9101:9101"
+    restart: unless-stopped
+
+  # --- Step 1b: collector -> Grafana Cloud Mimir ------------------------------
+  alloy:
+    image: grafana/alloy:latest
+    container_name: deadair-alloy
+    command:
+      [
+        "run",
+        "--server.http.listen-addr=0.0.0.0:12345",
+        "--storage.path=/var/lib/alloy/data",
+        "/etc/alloy/config.alloy",
+      ]
+    volumes:
+      - ./plant/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+    env_file:
+      - agents/grafana_probe/.env
+    ports:
+      # Alloy's own UI -- component graph and remote_write health.
+      - "127.0.0.1:12345:12345"
+    depends_on:
+      - emitter
+    restart: unless-stopped
+
+  # --- Step 1d: local alert webhook receiver ---------------------------------
+  webhook:
+    build: ./plant/webhook
+    container_name: deadair-webhook
+    ports:
+      - "127.0.0.1:9102:9102"
+    restart: unless-stopped
+
+volumes:
+  alloy-data:
