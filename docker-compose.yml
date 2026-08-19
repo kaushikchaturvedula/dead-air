@@ -89,11 +89,17 @@ services:
   # Fault injection is application-level, NOT tc netem: netem needs NET_ADMIN,
   # which Cloud Run does not grant. See plant/edge/edge.py.
   edge-us-east1:
-    build: ./plant/edge
+    build:
+      context: ./plant
+      dockerfile: edge/Dockerfile
     container_name: deadair-edge-us-east1
     environment:
       EDGE_REGION: us-east1
       ORIGIN_URL: http://origin:8080
+      OTEL_SERVICE_NAME: "deadair-edge-us-east1"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
+      TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
+      DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     ports:
       - "127.0.0.1:8081:8080"
     depends_on:
@@ -101,11 +107,17 @@ services:
     restart: unless-stopped
 
   edge-europe-west1:
-    build: ./plant/edge
+    build:
+      context: ./plant
+      dockerfile: edge/Dockerfile
     container_name: deadair-edge-europe-west1
     environment:
       EDGE_REGION: europe-west1
       ORIGIN_URL: http://origin:8080
+      OTEL_SERVICE_NAME: "deadair-edge-europe-west1"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
+      TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
+      DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     ports:
       - "127.0.0.1:8082:8080"
     depends_on:
@@ -113,11 +125,17 @@ services:
     restart: unless-stopped
 
   edge-asia-south1:
-    build: ./plant/edge
+    build:
+      context: ./plant
+      dockerfile: edge/Dockerfile
     container_name: deadair-edge-asia-south1
     environment:
       EDGE_REGION: asia-south1
       ORIGIN_URL: http://origin:8080
+      OTEL_SERVICE_NAME: "deadair-edge-asia-south1"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
+      TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
+      DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     ports:
       - "127.0.0.1:8083:8080"
     depends_on:
@@ -128,7 +146,9 @@ services:
   # Where rebuffer ratio is born. Metrics are aggregated by region and
   # device_class only; per-session QoE beacons go to Loki.
   viewers:
-    build: ./plant/viewers
+    build:
+      context: ./plant
+      dockerfile: viewers/Dockerfile
     container_name: deadair-viewers
     environment:
       EDGES: "us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080"
@@ -139,6 +159,10 @@ services:
       # reports is the plant's, not the laptop's. Lower this if your box is
       # smaller; a realistic curve from fewer clients beats a starved one.
       CLIENTS_PER_REGION: "${CLIENTS_PER_REGION:-67}"
+      OTEL_SERVICE_NAME: "deadair-viewers"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
+      TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
+      DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     volumes:
       # Beacons land next to the origin access log; Alloy tails both.
       - nginx-logs:/var/log/deadair
@@ -187,6 +211,8 @@ services:
     ports:
       # Alloy's own UI -- component graph and remote_write health.
       - "127.0.0.1:12345:12345"
+      # OTLP/HTTP receiver for plant traces.
+      - "127.0.0.1:4318:4318"
     depends_on:
       - emitter
       - encoder

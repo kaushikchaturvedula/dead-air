@@ -218,6 +218,35 @@ with `session_id` in the log line, never as a label. A canary carrying
 `session_id`, `region` and `device_class` proves the guard strips the first and
 keeps the other two. Whole plant: **172 active series** against a ~10k budget.
 
+**The fault menu (complete).** All five of §5's faults run end to end, each with
+a distinct, measured telemetry signature — the answer key the agent is graded
+against ([docs/plant.md](docs/plant.md#the-fault-menu--ground-truth-for-agent-week)):
+
+| Fault | rebuffer | bitrate | 4xx | tell |
+| --- | --- | --- | --- | --- |
+| `edge_latency` | 0.44, **one region** | drops, one region | none | regional, not plant-wide |
+| `segment_gap` | ~0.05, all regions | unchanged | **sustained** | packager fault |
+| `ladder_collapse` | **zero** | 3.6 → 2.0 Mbps | transient only | manifest 4 → 3 rungs |
+| `black_source` | zero | unchanged | none | **nothing moves** |
+| `ladder_mismatch` | zero | unchanged | none | **nothing moves** |
+
+The last two are invisible in every metric, log and trace — and that is the
+point. `black_source` shows a black frame with the timecode still running;
+`ladder_mismatch` shows a visibly soft 1080p rung carrying upscaled 720p detail
+at full bitrate. Only frame inspection catches either.
+
+```bash
+make chaos MODE=black_source
+make chaos MODE=edge_latency REGION=europe-west1
+make chaos-status && make chaos-clear
+```
+
+**All three signals are live.** Metrics → Mimir, logs → Loki, traces → Tempo,
+with `traceparent` carried into the origin access log so a log line joins to its
+trace. A captured trace reads *viewer 7.8ms → edge 5.9ms (cache MISS) → origin
+3.5ms* — causality neither metrics nor logs can express, and what the agent's
+Phase 1 fans out across.
+
 **Step 5 — cloud deployment (not started).** GCE origin, then three Cloud Run
 edges. Nothing is blocked on it — all four layers run locally today.
 

@@ -437,6 +437,51 @@ def hop_loki(env):
     return True
 
 
+def hop_traces(env):
+    """Traces are the third signal of brief §5's L4. Metrics say a region is
+    rebuffering and logs say which segment 404'd; only a trace says how much of
+    a slow fetch was the edge versus the origin."""
+    base = env.get("GRAFANA_URL", "").rstrip("/")
+    token = env.get("GRAFANA_SERVICE_ACCOUNT_TOKEN")
+    if not base or not token:
+        print(f"{WARN} traces: cannot query (Grafana credentials missing)")
+        return False
+
+    # Exporter health first: a dead pipeline should not look like "no traffic".
+    try:
+        local = scrape(VIEWERS)
+    except Exception:
+        local = {}
+    failed = local.get("trace_spans_failed_total", 0)
+    dropped = local.get("trace_spans_dropped_total", 0)
+    exported = local.get("trace_spans_exported_total", 0)
+    if exported <= 0:
+        print(f"{WARN} traces: viewer fleet has exported no spans yet")
+        return False
+
+    end = int(time.time())
+    start = end - 900
+    q = urllib.request.quote('{name="origin.fetch_segment"}')
+    url = (f"{base}/api/datasources/proxy/uid/grafanacloud-traces"
+           f"/api/search?q={q}&start={start}&end={end}&limit=5")
+    try:
+        traces = (json.loads(get(url, token)) or {}).get("traces") or []
+    except Exception as e:
+        print(f"{WARN} traces: Tempo query failed ({e})")
+        return False
+    if not traces:
+        print(f"{WARN} traces: no client->edge->origin traces in the last 15m")
+        print("       -> a cache-miss fetch must be sampled; raise "
+              "TRACE_SAMPLE_RATIO if this is persistently empty")
+        return False
+
+    note = f", {int(failed)} failed" if failed else ""
+    note += f", {int(dropped)} dropped" if dropped else ""
+    print(f"{OK} traces: {len(traces)} client->edge->origin trace(s) in Tempo "
+          f"({int(exported)} spans exported{note})")
+    return True
+
+
 def main():
     env = load_env(ENV_PATH)
     print("DEAD AIR plant\n")
@@ -462,11 +507,18 @@ def main():
         sys.exit(1)
 
     logs_ok = hop_loki(env) and hop_beacons(env)
+    traces_ok = hop_traces(env)
 
     print("\nMetrics pipeline healthy end to end.")
     if not logs_ok:
         print("Logs pipeline NOT yet verified (see WARN above) -- "
               "metrics are unaffected.")
+    if not traces_ok:
+        print("Traces NOT yet verified (see WARN above) -- "
+              "metrics and logs are unaffected.")
+    if logs_ok and traces_ok:
+        print("All three signals (metrics, logs, traces) confirmed -- "
+              "the agent's Phase 1 fan-out has everything it needs.")
     sys.exit(0)
 
 

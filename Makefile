@@ -24,7 +24,7 @@ ALLOY_UI := http://localhost:12345
 .PHONY: help plant-up plant-down plant-restart plant-status plant-logs \
         set value watch alerts provision tunnel tunnel-url verify \
         player ladder black-source restore-source frame \
-        edges edge-port chaos chaos-clear \
+        edges edge-port chaos chaos-clear chaos-status \
         mcp-up mcp-down clean
 
 help: ## Show available targets
@@ -95,21 +95,15 @@ frame: ## Grab the current frame from the top rung as a PNG (frames/ is gitignor
 	ffmpeg -v error -y -i /tmp/deadair-frame.ts -frames:v 1 frames/latest.png; \
 	echo "wrote frames/latest.png (from $$seg)"
 
-# Brief §5 chaos mode `black_source`: the failure the whole demo is built
-# around. Delivery telemetry stays perfectly green -- segments keep flowing at
-# the right size and cadence -- while the picture is gone. The encoder reads its
-# input from ENCODER_SOURCE precisely so this is a restart, not a code change.
-black-source: ## CHAOS: swap the encoder input to black (every metric stays green)
-	ENCODER_SOURCE="color=black:size=1920x1080:rate=30" \
-	  $(COMPOSE) up -d --force-recreate encoder
-	@echo
-	@echo "  source is now BLACK. Metrics will look healthy; the picture is gone."
-	@echo "  compare: make frame     (and watch the dashboard stay green)"
-	@echo "  restore: make restore-source"
+# Superseded by `make chaos MODE=black_source`, which switches the encoder in
+# place instead of recreating the container. Kept as aliases because the demo
+# script and docs refer to them by name.
+black-source: ## CHAOS alias: make chaos MODE=black_source
+	@$(MAKE) -s chaos MODE=black_source
 
-restore-source: ## Restore the normal test pattern source
-	$(COMPOSE) up -d --force-recreate encoder
-	@echo "  source restored to testsrc2 + timecode"
+restore-source: ## Alias: clear L1 faults
+	@curl -sS -X POST "$(ENCODER)/chaos" -H 'Content-Type: application/json' \
+	  -d '{"mode":"none","severity":0}'
 
 # --- L2: edges + chaos ------------------------------------------------------
 # Local port per simulated region. On Cloud Run these become service URLs and
@@ -132,25 +126,57 @@ edges: ## Show each edge's region, chaos state and cache hit ratio
 edge-port: # internal: resolve a region to its local port
 	@echo "$(EDGE_PORT_$(REGION))"
 
-chaos: ## Inject a fault: make chaos REGION=europe-west1 MODE=edge_latency [SEVERITY=2]
-ifndef REGION
-	$(error usage: make chaos REGION=<$(REGIONS)> MODE=<edge_latency|segment_gap|none> [SEVERITY=1-3])
-endif
-ifndef MODE
-	$(error usage: make chaos REGION=$(REGION) MODE=<edge_latency|segment_gap|none> [SEVERITY=1-3])
-endif
-	@port=$(EDGE_PORT_$(REGION)); \
-	if [ -z "$$port" ]; then echo "unknown region '$(REGION)' (known: $(REGIONS))"; exit 1; fi; \
-	curl -sS -X POST "http://localhost:$$port/chaos" \
-	  -H 'Content-Type: application/json' \
-	  -d '{"mode":"$(MODE)","severity":$(or $(SEVERITY),2)}'
-	@echo "  other regions are untouched -- that differential is the point"
+# Brief §5's fault menu. edge_latency is region-scoped (L2); the rest are
+# plant-wide L1 faults driven at the encoder. See docs/plant.md for the
+# expected telemetry signature of each.
+L1_MODES := black_source ladder_collapse ladder_mismatch segment_gap
+L2_MODES := edge_latency
 
-chaos-clear: ## Clear injected faults in every region
+chaos: ## Inject a fault: make chaos MODE=<mode> [REGION=... SEVERITY=n]
+ifndef MODE
+	$(error usage: make chaos MODE=<$(L2_MODES) (needs REGION) | $(L1_MODES)> [SEVERITY=n])
+endif
+	@set -e; \
+	case " $(L1_MODES) " in \
+	  *" $(MODE) "*) \
+	    curl -sS -X POST "$(ENCODER)/chaos" -H 'Content-Type: application/json' \
+	      -d '{"mode":"$(MODE)","severity":$(or $(SEVERITY),0)}'; \
+	    echo "  L1 fault, plant-wide. Expected signature: docs/plant.md"; \
+	    ;; \
+	  *) \
+	    case " $(L2_MODES) " in \
+	      *" $(MODE) "*) \
+	        if [ -z "$(REGION)" ]; then \
+	          echo "MODE=$(MODE) is region-scoped -- pass REGION=<$(REGIONS)>"; exit 1; fi; \
+	        port=$(EDGE_PORT_$(REGION)); \
+	        if [ -z "$$port" ]; then \
+	          echo "unknown region '$(REGION)' (known: $(REGIONS))"; exit 1; fi; \
+	        curl -sS -X POST "http://localhost:$$port/chaos" \
+	          -H 'Content-Type: application/json' \
+	          -d '{"mode":"$(MODE)","severity":$(or $(SEVERITY),2)}'; \
+	        echo "  other regions are untouched -- that differential is the point"; \
+	        ;; \
+	      *) echo "unknown MODE '$(MODE)'"; \
+	         echo "  L1 (plant-wide): $(L1_MODES)"; \
+	         echo "  L2 (per-region): $(L2_MODES)"; exit 1;; \
+	    esac;; \
+	esac
+
+chaos-clear: ## Clear every injected fault, L1 and all regions
+	@curl -sS -X POST "$(ENCODER)/chaos" -H 'Content-Type: application/json' \
+	  -d '{"mode":"none","severity":0}'
 	@for r in $(REGIONS); do \
 	  port=$$($(MAKE) -s edge-port REGION=$$r); \
 	  curl -sS -X POST "http://localhost:$$port/chaos" \
 	    -H 'Content-Type: application/json' -d '{"mode":"none","severity":0}'; \
+	done
+
+chaos-status: ## Show every injected fault across L1 and L2
+	@printf "L1 encoder      "; curl -sS "$(ENCODER)/chaos" 2>/dev/null || echo "unreachable"
+	@for r in $(REGIONS); do \
+	  port=$$($(MAKE) -s edge-port REGION=$$r); \
+	  printf "L2 %-13s " "$$r"; \
+	  curl -sS "http://localhost:$$port/chaos" 2>/dev/null || echo "unreachable"; \
 	done
 
 # --- Grafana Cloud ----------------------------------------------------------

@@ -35,6 +35,9 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Named deadair_trace, not trace: `trace` is a stdlib module name.
+import deadair_trace as tracing
+
 PORT = int(os.environ.get("VIEWER_METRICS_PORT", "9104"))
 BEACON_LOG = os.environ.get("BEACON_LOG", "/var/log/deadair/viewers.log")
 
@@ -139,15 +142,30 @@ class Session(threading.Thread):
         self.startup_time = None
         self.rebuffer_count = 0
         self.rebuffer_seconds = 0.0
-        self.played = set()
+        # Absolute HLS media sequence of the last segment played. Tracking the
+        # SEQUENCE rather than the filename matters: ffmpeg renumbers from
+        # seg_00000.ts every time it restarts, which chaos does constantly, so a
+        # filename-keyed "already played" set makes every new segment look stale
+        # and wedges the session permanently.
+        self.last_seq = None
+        self.resyncs = 0
+        # Renditions the master manifest currently advertises. A real ABR player
+        # only ever selects from this list, which is what makes ladder_collapse
+        # present as "bitrate drops, no rebuffer": the top rung disappears from
+        # the manifest and players quietly settle lower instead of stalling on a
+        # rung that no longer exists.
+        self.available = list(RUNGS)
+        self.master_checked = 0.0
 
     # --- transport ---------------------------------------------------------
 
-    def fetch(self, path, timeout=45):
+    def fetch(self, path, timeout=45, span=None):
         url = f"{self.base}{path}"
         req = urllib.request.Request(url)
         req.add_header("X-Deadair-Session", self.session_id)
         req.add_header("User-Agent", f"deadair-viewer/{self.device}")
+        if span is not None:
+            req.add_header("traceparent", span.traceparent())
         t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -162,12 +180,67 @@ class Session(threading.Thread):
         except Exception:
             return 0, b"", time.time() - t0
 
+    def fetch_segment_traced(self, rung, seg):
+        """Segment fetch, head-sampled into a trace.
+
+        The viewer owns the sampling decision because it is the root of the
+        request: sampling here yields whole client -> edge -> origin trees, and
+        the span carries the per-session detail that metrics deliberately drop.
+        """
+        if not tracing.should_sample():
+            return self.fetch(f"/hls/{rung}/{seg}")
+        span = tracing.Span(
+            "viewer.segment_fetch",
+            kind="client",
+            sampled=True,
+            attributes={
+                "deadair.layer": "L3",
+                "deadair.session_id": self.session_id,
+                "deadair.region": self.region,
+                "deadair.device_class": self.device,
+                "deadair.rendition": rung,
+                "deadair.segment": seg,
+                "deadair.buffer_seconds": round(self.buffer, 2),
+            },
+        )
+        with span:
+            status, body, dt = self.fetch(f"/hls/{rung}/{seg}", span=span)
+            span.set("http.status_code", status)
+            span.set("deadair.download_seconds", round(dt, 4))
+            # The span records whether THIS fetch is the one that stalled the
+            # viewer -- the causal link between a slow edge and a rebuffer event
+            # that no metric or log line can express on its own.
+            span.set("deadair.caused_rebuffer",
+                     bool(self.buffer + SEGMENT_SECONDS - dt <= 0))
+            if status != 200:
+                span.error(f"segment fetch returned {status}")
+        return status, body, dt
+
     # --- ABR ---------------------------------------------------------------
+
+    def refresh_master(self):
+        """Re-read which renditions the master manifest advertises."""
+        self.master_checked = time.time()
+        status, body, _dt = self.fetch("/hls/master.m3u8", timeout=20)
+        if status != 200 or not body:
+            return
+        text = body.decode(errors="replace")
+        found = [r for r in RUNGS if f"{r}/index.m3u8" in text]
+        if found:
+            self.available = found
+            self.rung_index = min(self.rung_index, len(self.available) - 1)
+
+    def current_rung(self):
+        if not self.available:
+            self.available = list(RUNGS)
+        self.rung_index = min(self.rung_index, len(self.available) - 1)
+        return self.available[self.rung_index]
 
     def adapt(self, download_time):
         """Step down when we cannot keep up, back up when we have headroom."""
+        ceiling = len(self.available) - 1
         if download_time > SEGMENT_SECONDS * 0.9:
-            if self.rung_index < len(RUNGS) - 1:
+            if self.rung_index < ceiling:
                 self.rung_index += 1
         elif download_time < SEGMENT_SECONDS * 0.35 and self.buffer > self.buffer_target * 0.6:
             if self.rung_index > 0:
@@ -185,28 +258,68 @@ class Session(threading.Thread):
 
         last_beacon = time.time()
 
+        self.refresh_master()
+
         while True:
-            rung = RUNGS[self.rung_index]
+            # Re-read the master periodically so a rung appearing or vanishing
+            # is noticed the way a real player would notice it.
+            if time.time() - self.master_checked > 20:
+                self.refresh_master()
+
+            rung = self.current_rung()
             status, body, _dt = self.fetch(f"/hls/{rung}/index.m3u8")
             if status != 200 or not body:
-                # Manifest unavailable: the buffer drains in real time.
+                # The rung we were on may have been withdrawn from the ladder.
+                # Re-read the master and pick again before treating this as a
+                # stall, so a withdrawn rendition costs quality, not continuity.
+                self.refresh_master()
+                rung = self.current_rung()
+                status, body, _dt = self.fetch(f"/hls/{rung}/index.m3u8")
+            if status != 200 or not body:
                 time.sleep(SEGMENT_SECONDS / 2)
                 self.drain(SEGMENT_SECONDS / 2)
                 continue
 
-            segs = [l.strip() for l in body.decode(errors="replace").splitlines()
-                    if l.strip().endswith(".ts")]
-            fresh = [s for s in segs if f"{rung}/{s}" not in self.played][-2:]
+            lines = body.decode(errors="replace").splitlines()
+            media_seq = 0
+            names = []
+            for line in lines:
+                line = line.strip()
+                if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                    try:
+                        media_seq = int(line.split(":", 1)[1])
+                    except ValueError:
+                        media_seq = 0
+                elif line.endswith(".ts"):
+                    names.append(line)
+            segs = [(media_seq + i, n) for i, n in enumerate(names)]
+            if not segs:
+                time.sleep(SEGMENT_SECONDS / 2)
+                self.drain(SEGMENT_SECONDS / 2)
+                continue
+
+            # The stream renumbered beneath us (encoder restart / discontinuity):
+            # resync to the live edge instead of waiting for sequence numbers
+            # that will never arrive. A real player does the same.
+            newest = segs[-1][0]
+            if self.last_seq is not None and newest < self.last_seq:
+                self.last_seq = None
+                self.buffer = 0.0
+                self.resyncs += 1
+
+            if self.last_seq is None:
+                fresh = segs[-1:]                       # jump to live edge
+            else:
+                fresh = [s for s in segs if s[0] > self.last_seq][-2:]
+
             if not fresh:
                 time.sleep(SEGMENT_SECONDS / 2)
                 self.drain(SEGMENT_SECONDS / 2)
                 continue
 
-            for seg in fresh:
-                status, body, download_time = self.fetch(f"/hls/{rung}/{seg}")
-                self.played.add(f"{rung}/{seg}")
-                if len(self.played) > 400:
-                    self.played = set(list(self.played)[-200:])
+            for seq, seg in fresh:
+                status, body, download_time = self.fetch_segment_traced(rung, seg)
+                self.last_seq = seq
 
                 if self.startup_time is None:
                     self.startup_time = time.time() - started
@@ -242,7 +355,7 @@ class Session(threading.Thread):
                 # show a drop clearly.
                 with _lock:
                     _current_rung[self.session_id] = (
-                        self.region, self.device, RUNG_BITRATE[RUNGS[self.rung_index]]
+                        self.region, self.device, RUNG_BITRATE[self.current_rung()]
                     )
 
                 # Pace to the playback clock: hold roughly buffer_target of
@@ -278,11 +391,11 @@ class Session(threading.Thread):
             "session_id": self.session_id,
             "region": self.region,
             "device_class": self.device,
-            "rendition": RUNGS[self.rung_index],
+            "rendition": self.current_rung(),
             "startup_time": round(self.startup_time or 0.0, 3),
             "rebuffer_count": self.rebuffer_count,
             "rebuffer_sec": round(self.rebuffer_seconds, 3),
-            "bitrate": RUNG_BITRATE[RUNGS[self.rung_index]],
+            "bitrate": RUNG_BITRATE[self.current_rung()],
             "buffer_seconds": round(self.buffer, 2),
         })
 
@@ -364,6 +477,9 @@ def render_metrics():
         'viewer_cardinality_canary{session_id="viewer-canary-0001",'
         'region="us-east1",device_class="tv"} 1\n',
     ]
+    # Exporter health, so a silently dead trace pipeline is visible in metrics
+    # rather than as an empty Tempo query nobody notices.
+    out.append(tracing.render_metrics())
     return "".join(out)
 
 

@@ -265,6 +265,59 @@ loki.process "origin_access" {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Traces: plant services -> Grafana Cloud Tempo
+// ---------------------------------------------------------------------------
+// The third signal of brief §5's L4. Metrics say a region is rebuffering; logs
+// say which segment 404'd; only a trace says "this viewer's fetch took 6.2s, of
+// which 5.9s was the edge waiting on origin" -- causality and blame, which is
+// what the agent's Phase 1 needs to distinguish an edge fault from an origin
+// fault.
+//
+// Per-session detail rides in span ATTRIBUTES, which are not a cardinality
+// problem the way labels are, so session_id and segment names belong here.
+//
+// The plant services emit OTLP/HTTP JSON directly (stdlib, no SDK) -- see
+// plant/shared/deadair_trace.py.
+
+otelcol.receiver.otlp "plant" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces = [otelcol.processor.batch.plant.input]
+  }
+}
+
+otelcol.processor.batch "plant" {
+  // Modest batches: the plant is small and we would rather see traces promptly
+  // during a chaos run than optimise throughput.
+  send_batch_size = 256
+  timeout         = "5s"
+
+  output {
+    traces = [otelcol.exporter.otlp.grafana_cloud.input]
+  }
+}
+
+otelcol.auth.basic "grafana_cloud" {
+  username = sys.env("GRAFANA_TEMPO_USER")
+  password = sys.env("GRAFANA_CLOUD_METRICS_TOKEN")
+}
+
+// gRPC, not HTTP. Grafana Cloud Tempo's push endpoint is OTLP/gRPC on :443 --
+// the tempo-*.grafana.net host serves the QUERY API over HTTP and 404s on
+// /otlp/v1/traces, while the otlp-gateway host wants a different instance ID
+// from the one the Tempo datasource uses. gRPC to the Tempo host with the
+// datasource's own instance ID is the combination that works.
+otelcol.exporter.otlp "grafana_cloud" {
+  client {
+    endpoint = sys.env("GRAFANA_TEMPO_GRPC")
+    auth     = otelcol.auth.basic.grafana_cloud.handler
+  }
+}
+
 loki.write "grafana_cloud" {
   endpoint {
     url = sys.env("GRAFANA_LOKI_URL")

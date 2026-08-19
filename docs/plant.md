@@ -361,6 +361,169 @@ does, so `session_id` stays in the beacon body while only bounded fields
 Total active series for the whole plant: **172**, against a ~10k free-tier
 budget.
 
+## The fault menu — ground truth for agent week
+
+Every fault in brief §5's menu, driven end to end and measured. **This is the
+answer key**: the agent's job is to reach the right diagnosis from these
+signatures alone, so they must be genuinely distinguishable.
+
+```bash
+make chaos MODE=black_source                            # L1, plant-wide
+make chaos MODE=ladder_collapse
+make chaos MODE=ladder_mismatch
+make chaos MODE=segment_gap [SEVERITY=7]
+make chaos MODE=edge_latency REGION=europe-west1 [SEVERITY=2]   # L2, one region
+make chaos-clear
+make chaos-status
+```
+
+Regenerate the whole table with
+[`scripts/fault_signatures.py`](../scripts/fault_signatures.py), which injects
+each fault in turn and reports what moved. Run it after any change to the
+encoder, edges or ladder.
+
+### Measured signatures, 2026-08-19
+
+| Fault | Scope | rebuffer_ratio | Delivered bitrate | 4xx | Other |
+| --- | --- | --- | --- | --- | --- |
+| **edge_latency** | one region | **0.437 in europe-west1 only** | 3.7 → 0.8 Mbps, that region only | none | p95 TTFB ~1s in that region |
+| **segment_gap** | all regions | 0.034 / 0.068 / 0.035 — **every region** | unchanged | **sustained, every region** | `packager_segments_deleted_total` climbing |
+| **ladder_collapse** | all regions | **0 everywhere** | **3.6 → 2.0 Mbps, every region** | transient only | manifest **4 → 3 rungs**; `packager_segment_lag{1080p}` climbs unbounded |
+| **black_source** | all regions | 0 | unchanged | none | **nothing moves.** fps 30, 0 drops, lag normal |
+| **ladder_mismatch** | all regions | 0 | unchanged | none | **nothing moves at all** |
+
+### How to tell them apart
+
+**Regional vs plant-wide** is the first cut. `edge_latency` moves one region and
+leaves the other two untouched; everything else moves all three. A fault in one
+region is a delivery-path fault, and the agent should not go looking at the
+encoder.
+
+**Rebuffering vs bitrate** separates the plant-wide faults. `ladder_collapse`
+drops bitrate with *zero* rebuffering — players quietly settled onto a lower
+rung because the top one vanished from the manifest. `segment_gap` does the
+opposite: bitrate is untouched, but segments are missing, so viewers stall.
+
+**4xx persistence, not presence.** `ladder_collapse` also emits a burst of 404s
+while players discover the withdrawn rung — realistic, and a trap. What
+distinguishes it from `segment_gap` is that its 404s *stop* once players re-read
+the master manifest, while `segment_gap`'s continue indefinitely. An agent that
+keys on "are there 404s" rather than "are 404s ongoing" will confuse the two.
+
+**The last two are invisible.** `black_source` and `ladder_mismatch` are
+identical in every metric, log and trace — and identical to healthy. They are
+the faults only frame inspection catches, and the reason this project exists:
+
+- **black_source** — the frame is black, but the burned-in timecode keeps
+  running. Black picture, live encoder.
+- **ladder_mismatch** — the 1080p rung is visibly soft: 720p detail upscaled to
+  1920×1080, at the full 1080p bitrate. The manifest, segment sizes and cadence
+  are all exactly right. Verified by cropping the test pattern's fine
+  checkerboard from a healthy frame and a faulted one: the healthy frame has
+  crisp high-frequency noise, the faulted one is smoothed.
+
+`make frame` grabs the current top-rung frame; the signature harness writes one
+per mode to `frames/signature-<mode>.png`.
+
+### Chaos is a POST, not a restart
+
+L1 faults switch the running encoder in place (`POST /chaos` on :9103), so the
+demo can move between faults in seconds. Modes that change what is encoded
+restart ffmpeg internally; `segment_gap` does not restart anything, it just
+deletes segments after the packager writes them.
+
+`segment_gap` is deliberately at the **origin**, not the edge, because that
+placement *is* the diagnosis: a gap at the packager 404s in every region at
+once, which is what separates "packager fault" from "one edge is sick".
+
+### Two bugs this exercise caught
+
+**Filename-keyed dedup wedged the fleet.** Viewers tracked played segments by
+filename, but ffmpeg renumbers from `seg_00000.ts` on every restart — which
+chaos does constantly. After one restart every "new" segment looked already
+played, `fresh` was empty forever, and the whole fleet sat at
+`rebuffer_ratio` 1.0 regardless of the injected fault. Every signature looked
+identical because the dominant signal was the harness, not the fault. Viewers
+now track the absolute **HLS media sequence** and resync when the stream
+renumbers, exactly as a real player does.
+
+**Clearing all segments on restart drowned out the fault.** Wiping every rung on
+each mode switch 404'd the segments viewers were actively fetching, so every
+mode presented as "404 storm everywhere". Only rungs that are actually being
+withdrawn are cleared now.
+
+Both produced *plausible* telemetry, which is the dangerous kind of wrong: the
+signatures looked like real faults and would have trained agent week against
+noise.
+
+## Traces — the third signal
+
+Brief §5's L4 asks for traces, and the agent's Phase 1 fans out across all
+three signals. What each one can and cannot say about the same slow fetch:
+
+| Signal | Answers | Cannot say |
+| --- | --- | --- |
+| Metrics | "rebuffer ratio in europe-west1 is 0.19" | which request, or why |
+| Logs | "this segment 404'd for this session" | how long each hop took |
+| Traces | "this fetch took 7.8ms, of which 5.9ms was the edge and 3.5ms was origin" | aggregate rates |
+
+A real captured trace:
+
+```
+viewer.segment_fetch        [deadair-viewers]            7.8ms
+  session_id=europe-west1-desktop-052  region=europe-west1  status=200
+  edge.serve_segment        [deadair-edge-europe-west1]  5.9ms
+    cache=MISS  response_size=1559460  status=200
+    origin.fetch_segment    [deadair-edge-europe-west1]  3.5ms
+      response_size=1559460  status=200
+```
+
+That tree is what tells the agent whether a slow edge is slow *itself* or just
+waiting on origin — a distinction metrics and logs cannot express.
+
+**Implementation.** The plant's services are dependency-free stdlib processes,
+so rather than pull in the OpenTelemetry SDK they emit OTLP JSON directly
+([`plant/shared/deadair_trace.py`](../plant/shared/deadair_trace.py), ~200
+lines) to Alloy, which forwards to Tempo.
+
+- **Head-based sampling at the viewer** (2% by default, `TRACE_SAMPLE_RATIO`).
+  The client owns the decision and propagates it via the W3C `traceparent`
+  sampled flag, so a sampled request yields a *complete* tree rather than
+  disconnected middle spans.
+- **Per-session detail rides in span attributes** — `session_id`, `segment`,
+  `rendition`, `buffer_seconds`. Attributes are not a cardinality problem the
+  way labels are, so this is where that detail belongs alongside Loki.
+- **`traceparent` is forwarded to the origin and logged by nginx**, bridging
+  Loki and Tempo: from a slow trace you can find the exact origin log line, and
+  from a 404 log line you can pull up the trace that produced it.
+- **Exporter health is a metric** (`trace_spans_exported_total`,
+  `_failed_total`, `_dropped_total`), so a silently dead trace pipeline shows up
+  in Mimir rather than as an empty Tempo query nobody notices.
+
+**Endpoint gotcha.** Grafana Cloud Tempo ingests OTLP over **gRPC on :443**. The
+`tempo-*.grafana.net` host serves the *query* API over HTTP and 404s on
+`/otlp/v1/traces`, while the `otlp-gateway-*` host expects a different instance
+ID from the one the Tempo datasource uses. gRPC to the Tempo host with the
+datasource's own instance ID is the combination that works.
+
+## L0 — the synthetic canary is deliberate
+
+The `deadair_synthetic_gauge` panels are **not leftovers**. They live in a
+collapsed row at the bottom of the dashboard, labelled "pipe health (synthetic
+canary, not plant telemetry)", and they answer a question no plant metric can:
+
+> Encoder metrics just disappeared. Is the **plant** broken, or is the **pipe**
+> broken?
+
+The canary is driven by hand (`make set VALUE=95`) and touches no video path.
+If it still moves while plant metrics are missing, Alloy → Mimir is healthy and
+the fault is in the plant; if it stops too, the collector or remote_write is the
+problem. The emitter also carries `deadair_cardinality_canary`, which is how
+`make verify` proves the relabel guard still strips `session_id`.
+
+It carries **no alert** — the only alert is L3's `rebuffer_ratio`. The Step 1
+placeholder that once watched this gauge is deleted on every `make provision`.
+
 ## Step 5 — cloud deployment (not started, spends credits)
 
 GCE origin first, then the three Cloud Run edges — in that order, because an

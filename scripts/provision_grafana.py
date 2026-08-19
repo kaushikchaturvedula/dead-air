@@ -88,6 +88,53 @@ def ensure_folder(gf):
         print(f"  folder {FOLDER_UID!r} created")
 
 
+# Panel placement, applied after the panels are built. Reading order is the
+# plant itself -- L1 encoder, L2 edges, L3 viewers, then logs -- with the
+# synthetic pipe canary last and collapsed, because it is infrastructure for
+# diagnosing the observability stack rather than a signal about the stream.
+LAYOUT = {
+    10: (0, 0, 24, 1),                                    # row: L1
+    11: (0, 1, 8, 8),    12: (8, 1, 16, 8),
+    13: (0, 9, 6, 5),    14: (6, 9, 6, 5),
+    20: (0, 14, 24, 1),                                   # row: L2
+    21: (0, 15, 16, 9),  22: (16, 15, 8, 9),
+    23: (0, 24, 12, 8),  24: (12, 24, 12, 8),
+    30: (0, 32, 24, 1),                                   # row: L3
+    31: (0, 33, 16, 9),  32: (16, 33, 8, 9),
+    33: (0, 42, 12, 8),  34: (12, 42, 12, 8),
+    15: (0, 50, 24, 10),                                  # origin access log
+    40: (0, 60, 24, 1),                                   # row: L0 (collapsed)
+    1: (0, 61, 16, 8),   2: (16, 61, 8, 8),  3: (0, 69, 24, 7),
+}
+CANARY_PANEL_IDS = [1, 2, 3]
+
+
+def apply_layout(panels):
+    """Position panels and fold the canary into a collapsed row.
+
+    Grafana keeps a collapsed row's children inside the row's own `panels`
+    array rather than at the top level, so the nesting has to happen here.
+    """
+    for p in panels:
+        if p["id"] in LAYOUT:
+            x, y, w, h = LAYOUT[p["id"]]
+            p["gridPos"] = {"x": x, "y": y, "w": w, "h": h}
+
+    canary = [p for p in panels if p["id"] in CANARY_PANEL_IDS]
+    rest = [p for p in panels if p["id"] not in CANARY_PANEL_IDS]
+    x, y, w, h = LAYOUT[40]
+    rest.append({
+        "id": 40,
+        "type": "row",
+        "title": "L0 — pipe health (synthetic canary, not plant telemetry)",
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "collapsed": True,
+        "panels": canary,
+    })
+    rest.sort(key=lambda p: (p["gridPos"]["y"], p["gridPos"]["x"]))
+    return rest
+
+
 def dashboard_model():
     def target(expr, legend):
         return {
@@ -99,24 +146,20 @@ def dashboard_model():
             "refId": "A",
         }
 
-    return {
-        "uid": DASHBOARD_UID,
-        "title": "DEAD AIR -- Plant",
-        "tags": ["dead-air", "plant"],
-        "timezone": "browser",
-        "schemaVersion": 39,
-        "refresh": "10s",
-        "time": {"from": "now-30m", "to": "now"},
-        "panels": [
+    panels = [
             {
                 "id": 1,
                 "type": "timeseries",
-                "title": "Synthetic gauge (alert threshold "
-                         f"{THRESHOLD})",
+                "title": "Synthetic gauge — operator-driven canary",
                 "description": (
-                    "Step 1 proof-of-pipe signal. Drive it with "
-                    "`make set VALUE=95` and this panel plus the alert "
-                    "should go red within ~1 minute."
+                    "DELIBERATE, not a leftover. This gauge is driven by hand "
+                    "(`make set VALUE=95`) and has nothing to do with the "
+                    "video plant. It answers the question you cannot answer "
+                    "from plant metrics alone: when encoder or viewer metrics "
+                    "go missing, is the PLANT broken or is the PIPE broken? "
+                    "If this canary still moves, Alloy -> Mimir is healthy and "
+                    "the fault is in the plant. It carries no alert — the only "
+                    "alert is L3's rebuffer_ratio."
                 ),
                 "gridPos": {"h": 9, "w": 16, "x": 0, "y": 0},
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
@@ -139,7 +182,7 @@ def dashboard_model():
             {
                 "id": 2,
                 "type": "stat",
-                "title": "Current value",
+                "title": "Canary value now",
                 "gridPos": {"h": 9, "w": 8, "x": 16, "y": 0},
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
                 "targets": [target("deadair_synthetic_gauge", "value")],
@@ -165,9 +208,13 @@ def dashboard_model():
             {
                 "id": 3,
                 "type": "timeseries",
-                "title": "Scrape liveness (deadair_emitter_up)",
-                "description": "Proves the Alloy -> Mimir path is delivering, "
-                               "independent of the gauge value.",
+                "title": "Pipe liveness (deadair_emitter_up)",
+                "description": (
+                    "Flat line at 1 = the collector is scraping and "
+                    "remote_write is delivering. A gap here means the "
+                    "telemetry pipe failed, not the plant — which is exactly "
+                    "the ambiguity this row exists to resolve."
+                ),
                 "gridPos": {"h": 7, "w": 24, "x": 0, "y": 9},
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
                 "targets": [target("deadair_emitter_up", "{{component}}")],
@@ -481,7 +528,17 @@ def dashboard_model():
                 "options": {"showTime": True, "sortOrder": "Descending",
                             "wrapLogMessage": True},
             },
-        ],
+    ]
+
+    return {
+        "uid": DASHBOARD_UID,
+        "title": "DEAD AIR -- Plant",
+        "tags": ["dead-air", "plant"],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "refresh": "10s",
+        "time": {"from": "now-30m", "to": "now"},
+        "panels": apply_layout(panels),
     }
 
 

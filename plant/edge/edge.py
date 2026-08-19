@@ -38,6 +38,10 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+# Named deadair_trace, not trace: `trace` is a stdlib module and would be
+# shadowed by a local file of that name.
+import deadair_trace as tracing
+
 PORT = int(os.environ.get("PORT", "8080"))
 REGION = os.environ.get("EDGE_REGION", "unknown")
 ORIGIN = os.environ.get("ORIGIN_URL", "http://origin:8080").rstrip("/")
@@ -172,6 +176,9 @@ def render_metrics():
         "# TYPE edge_up gauge\n",
         f"edge_up{{{r}}} 1\n",
     ]
+    # Exporter health, so a silently dead trace pipeline shows up in metrics
+    # rather than as an empty Tempo query nobody notices.
+    out.append(tracing.render_metrics())
     return "".join(out)
 
 
@@ -220,11 +227,15 @@ def should_drop(path):
         return _seq % every == 0
 
 
-def fetch_origin(path):
+def fetch_origin(path, traceparent=None):
     """Fetch from origin. Returns (status, body, content_type)."""
     global _shield_misses
     url = f"{ORIGIN}{path}"
     req = urllib.request.Request(url)
+    if traceparent:
+        # Propagate to the origin so its access log line can be joined to the
+        # trace -- that is the Loki <-> Tempo bridge for a single request.
+        req.add_header("traceparent", traceparent)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = resp.read()
@@ -307,38 +318,85 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         global _hits, _misses
 
-        injected = apply_chaos_delay()
+        # Continue the viewer's trace if it sampled this request. The edge never
+        # starts its own sampling decision -- head-based sampling at the client
+        # is what keeps a sampled request a COMPLETE tree rather than a
+        # disconnected middle span.
+        ctx = tracing.parse_traceparent(self.headers.get("traceparent"))
+        with _lock:
+            chaos_mode = _chaos["mode"]
+        span = tracing.Span(
+            "edge.serve_segment",
+            trace_id=ctx[0] if ctx else None,
+            parent_id=ctx[1] if ctx else None,
+            kind="server",
+            sampled=bool(ctx and ctx[2]),
+            attributes={
+                "deadair.region": REGION,
+                "deadair.layer": "L2",
+                "http.route": path,
+                "deadair.chaos_mode": chaos_mode,
+                "deadair.session_id": self.headers.get("X-Deadair-Session", ""),
+            },
+        )
 
-        if should_drop(path):
-            record_status(404)
+        with span:
+            injected = apply_chaos_delay()
+            span.set("deadair.injected_delay_seconds", round(injected, 4))
+
+            if should_drop(path):
+                record_status(404)
+                observe_ttfb(time.time() - started)
+                span.set("http.status_code", 404).error("segment gap (chaos)")
+                self._send(404, b"segment gap (chaos)\n",
+                           extra={"X-Deadair-Chaos": "segment_gap"})
+                return
+
+            cached = cache_get(path)
+            if cached:
+                with _lock:
+                    _hits += 1
+                status, body, ctype = cached
+                cache_state = "HIT"
+            else:
+                with _lock:
+                    _misses += 1
+                # A child span for the origin call: this is what tells the agent
+                # whether a slow edge is slow itself or just waiting on origin.
+                origin_span = tracing.Span(
+                    "origin.fetch_segment",
+                    trace_id=span.trace_id, parent_id=span.span_id,
+                    kind="client", sampled=span.sampled,
+                    attributes={"deadair.layer": "L1", "http.route": path},
+                )
+                with origin_span:
+                    status, body, ctype = fetch_origin(
+                        path, traceparent=origin_span.traceparent())
+                    origin_span.set("http.status_code", status)
+                    origin_span.set("http.response_size", len(body))
+                    if status >= 400:
+                        origin_span.error(f"origin returned {status}")
+                cache_put(path, status, body, ctype)
+                cache_state = "MISS"
+
+            record_status(status)
+            # TTFB is recorded before throughput shaping so the metric keeps its
+            # meaning; the client's total download time carries the transfer cost.
             observe_ttfb(time.time() - started)
-            self._send(404, b"segment gap (chaos)\n",
-                       extra={"X-Deadair-Chaos": "segment_gap"})
-            return
+            shaped = apply_chaos_throughput(len(body))
 
-        cached = cache_get(path)
-        if cached:
-            with _lock:
-                _hits += 1
-            status, body, ctype = cached
-            cache_state = "HIT"
-        else:
-            with _lock:
-                _misses += 1
-            status, body, ctype = fetch_origin(path)
-            cache_put(path, status, body, ctype)
-            cache_state = "MISS"
+            span.set("deadair.cache", cache_state)
+            span.set("http.status_code", status)
+            span.set("http.response_size", len(body))
+            span.set("deadair.shaped_seconds", round(shaped, 4))
+            if status >= 400:
+                span.error(f"edge returned {status}")
 
-        record_status(status)
-        # TTFB is recorded before throughput shaping so the metric keeps its
-        # meaning; the client's total download time carries the transfer cost.
-        observe_ttfb(time.time() - started)
-        shaped = apply_chaos_throughput(len(body))
-        self._send(status, body, ctype, extra={
-            "X-Cache": cache_state,
-            "X-Deadair-Injected-Delay": f"{injected:.3f}",
-            "X-Deadair-Shaped-Seconds": f"{shaped:.3f}",
-        })
+            self._send(status, body, ctype, extra={
+                "X-Cache": cache_state,
+                "X-Deadair-Injected-Delay": f"{injected:.3f}",
+                "X-Deadair-Shaped-Seconds": f"{shaped:.3f}",
+            })
 
     def do_POST(self):
         if urlparse(self.path).path != "/chaos":
