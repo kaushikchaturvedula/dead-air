@@ -81,6 +81,63 @@ services:
       - encoder
     restart: unless-stopped
 
+  # --- L2: "CDN" edges (brief §5) --------------------------------------------
+  # Three caching reverse proxies standing in for three GCP regions. Locally
+  # they are containers; the same image deploys to Cloud Run unchanged, since it
+  # is a single stdlib process listening on $PORT with no kernel capabilities.
+  #
+  # Fault injection is application-level, NOT tc netem: netem needs NET_ADMIN,
+  # which Cloud Run does not grant. See plant/edge/edge.py.
+  edge-us-east1:
+    build: ./plant/edge
+    container_name: deadair-edge-us-east1
+    environment:
+      EDGE_REGION: us-east1
+      ORIGIN_URL: http://origin:8080
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      - origin
+    restart: unless-stopped
+
+  edge-europe-west1:
+    build: ./plant/edge
+    container_name: deadair-edge-europe-west1
+    environment:
+      EDGE_REGION: europe-west1
+      ORIGIN_URL: http://origin:8080
+    ports:
+      - "127.0.0.1:8082:8080"
+    depends_on:
+      - origin
+    restart: unless-stopped
+
+  edge-asia-south1:
+    build: ./plant/edge
+    container_name: deadair-edge-asia-south1
+    environment:
+      EDGE_REGION: asia-south1
+      ORIGIN_URL: http://origin:8080
+    ports:
+      - "127.0.0.1:8083:8080"
+    depends_on:
+      - origin
+    restart: unless-stopped
+
+  # Traffic so the per-region differential is observable. A stand-in for L3,
+  # not L3: no playback clock, no buffer model, no rebuffer events.
+  loadgen:
+    build: ./plant/loadgen
+    container_name: deadair-loadgen
+    environment:
+      EDGES: "us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080"
+      CLIENTS_PER_EDGE: "${CLIENTS_PER_EDGE:-3}"
+    depends_on:
+      - edge-us-east1
+      - edge-europe-west1
+      - edge-asia-south1
+    restart: unless-stopped
+
   # --- Step 1b: collector -> Grafana Cloud Mimir + Loki -----------------------
   alloy:
     image: grafana/alloy:latest

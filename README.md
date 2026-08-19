@@ -174,8 +174,34 @@ With the source black, `encoder_fps` holds 30.0, `dropped_frames` stays 0,
 metric is green while the screen is black — the thesis, on demand, in about
 fifteen seconds.
 
-**Step 3 — L2 edges (next).** Three regional caching proxies with chaos
-endpoints, then the viewer fleet where rebuffer ratio is born.
+**Step 3 — L2 CDN edges (working, local).** Three caching reverse proxies
+standing in for `us-east1`, `europe-west1` and `asia-south1`, exporting cache
+hit ratio, segment status, TTFB histograms and origin shield misses — with
+fault injection per region.
+
+```bash
+make edges                                          # per-region state
+make chaos REGION=europe-west1 MODE=edge_latency    # degrade one region
+make chaos-clear
+```
+
+Measured p95 segment TTFB with one region degraded: **europe-west1 981 ms vs
+us-east1 4.8 ms and asia-south1 4.9 ms** — a ~200× differential in exactly one
+region.
+
+Latency injection is application-level, not `tc netem`, deliberately: netem
+needs `NET_ADMIN`, which Cloud Run does not grant, so a netem-based mechanism
+would have to be rewritten the moment the edges deploy.
+
+**Step 4 — L3 viewer fleet (next).** ~200 modeled clients on a playback clock,
+where `rebuffer_ratio` is born.
+
+### Everything stays local until it has to move
+
+The plant runs entirely on Docker today. That is not just cost control: an edge
+in `europe-west1` needs a publicly reachable origin, so deploying L2 to Cloud
+Run silently requires L1 on GCE first. Local has no such ordering constraint,
+which makes it the cheaper place to be wrong.
 
 ## License
 

@@ -170,13 +170,93 @@ The encoder reads its input from `ENCODER_SOURCE`, so the swap is a container
 restart rather than a code change — which is what lets L2's chaos endpoint
 drive it later.
 
-## Step 3 — L2 edges + chaos endpoints (next)
+## Step 3 — L2 CDN edges ✅ (local)
 
-3× Cloud Run caching reverse proxies in us-east1 / europe-west1 / asia-south1,
-exporting `edge_cache_hit_ratio`, `segment_status`, `segment_ttfb_seconds`,
-`origin_shield_miss_total`, with `POST /chaos {region, mode, severity}`.
+Three caching reverse proxies standing in for `us-east1`, `europe-west1` and
+`asia-south1`, each exporting `edge_cache_hit_ratio`, `segment_status`,
+`segment_ttfb_seconds` (histogram) and `origin_shield_miss_total`, with
+`POST /chaos {mode, severity}`.
 
-Note for L2: `segment_ttfb_seconds` will be a histogram, and histograms carry a
-`le` label. The cardinality allowlist explicitly permits `le` and `quantile` —
-dropping `le` silently destroys every histogram, which would look like a broken
-exporter rather than a relabel bug.
+```bash
+make edges                                          # region, chaos state, hit ratio
+make chaos REGION=europe-west1 MODE=edge_latency    # degrade one region
+make chaos-clear                                    # restore all
+```
+
+### Why latency injection is application-level
+
+Brief §5 specifies `tc netem delay 800ms 200ms`. **netem cannot work on Cloud
+Run** — it needs `NET_ADMIN` on the container's network namespace, which the
+runtime does not grant. Building on netem locally would produce a chaos
+mechanism that has to be rewritten the moment the edges deploy.
+
+So the delay is injected in the request path instead
+([plant/edge/edge.py](../plant/edge/edge.py)). It needs no privileges, runs
+anywhere the container runs, and is indistinguishable from netem in the only
+place that matters: what the client observes. Severity mirrors §5's netem
+parameters — 1/2/3 → 200/800/2000 ms with proportional jitter.
+
+### Verified 2026-08-19
+
+`make chaos REGION=europe-west1 MODE=edge_latency SEVERITY=2`, p95 TTFB read
+back out of Mimir with `histogram_quantile`:
+
+| Region | p95 TTFB | State |
+| --- | --- | --- |
+| us-east1 | 4.8 ms | healthy |
+| **europe-west1** | **981.2 ms** | **degraded** |
+| asia-south1 | 4.9 ms | healthy |
+
+A ~200× differential in exactly one region, rendered on the dashboard panel.
+The degraded region also completes fewer requests per unit time, which is a
+useful secondary signal.
+
+### `le` survives the allowlist — confirmed end to end
+
+The histogram was the specific risk flagged when the allowlist went in. Checked
+in Mimir, not assumed: all 12 buckets present with
+`le = 0.005 … 10.0, +Inf`, full label set
+`__name__, component, env, instance, job, layer, le, project, region`, and
+`histogram_quantile` returns per-region values. `make verify` now asserts this
+on every run.
+
+### Cloud Run's hidden prerequisite
+
+L2-on-Cloud-Run silently depends on **L1-on-GCE**: an edge in `europe-west1`
+must reach the origin over the public internet, and the origin is currently a
+container on a laptop. Deploying the edges before the origin has a public
+address produces three edges that cannot fetch anything. The local plant has no
+such dependency, which is why it is worth completing first.
+
+### Traffic generation
+
+The differential is only visible if the edges are serving traffic, so
+[plant/loadgen/](../plant/loadgen/) drives a few clients per region. It is
+explicitly **not L3** — no playback clock, no buffer model, no rebuffer events,
+no QoE beacons. It walks the ladder like a player so cache ratios and TTFB
+distributions are realistic, and nothing more. L3 replaces it.
+
+## Verifying labels, not just their absence
+
+`make verify` asserts both directions, because they fail identically —
+silently, with data that looks healthy:
+
+- **Banned labels absent** — proven with a canary that deliberately carries
+  `session_id`, so the check cannot pass because the label was never emitted.
+- **Expected labels present** — `rendition` on `packager_segment_lag`,
+  `region` + `status` on `segment_status`, `le` on the TTFB histogram, and so
+  on. The `labelkeep` allowlist drops unknown labels *silently*: a metric
+  arrives looking fine, just without the dimension the diagnosis depends on.
+
+Both assertions were checked against a deliberately broken configuration to
+confirm they actually fail, rather than passing for the wrong reason.
+
+## Step 4 — L3 viewer fleet (next)
+
+~200 modeled clients on a playback clock computing
+`buffer += seg_duration - download_time`, plus real headless Chrome + hls.js
+players, emitting QoE beacons. This is where `rebuffer_ratio` is born, and it
+is what §5's real alert rule watches: `rebuffer_ratio > 0.02 for 2m, by region`.
+
+Per-session detail goes to Loki, never to Mimir labels — the split is already
+enforced and proven.

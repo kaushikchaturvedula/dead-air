@@ -269,6 +269,96 @@ def dashboard_model():
                 "options": {"colorMode": "background",
                             "reduceOptions": {"calcs": ["lastNotNull"]}},
             },
+            # --- L2: CDN edges ----------------------------------------------
+            {
+                "id": 20,
+                "type": "row",
+                "title": "L2 — CDN edges",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+                "collapsed": False,
+                "panels": [],
+            },
+            {
+                "id": 21,
+                "type": "timeseries",
+                "title": "p95 segment TTFB by region",
+                "description": (
+                    "The regional differential. One region climbing while the "
+                    "others stay flat is the edge_latency signature — CDN edge "
+                    "degradation, not an encoder or packager fault. Depends on "
+                    "the `le` label surviving the cardinality allowlist."
+                ),
+                "gridPos": {"h": 9, "w": 16, "x": 0, "y": 36},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [{
+                    "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                    "editorMode": "code",
+                    "expr": ("histogram_quantile(0.95, sum by (region, le) "
+                             "(rate(segment_ttfb_seconds_bucket[5m])))"),
+                    "legendFormat": "{{region}}",
+                    "range": True,
+                    "refId": "A",
+                }],
+                "fieldConfig": {
+                    "defaults": {
+                        "custom": {"lineWidth": 2, "fillOpacity": 6},
+                        "unit": "s",
+                        "thresholds": {"mode": "absolute", "steps": [
+                            {"color": "green", "value": None},
+                            {"color": "red", "value": 0.5}]},
+                    },
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 22,
+                "type": "timeseries",
+                "title": "Injected chaos by region",
+                "description": "Which region is currently being degraded, "
+                               "reported by the edges themselves.",
+                "gridPos": {"h": 9, "w": 8, "x": 16, "y": 36},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("edge_chaos_active", "{{region}}")],
+                "fieldConfig": {
+                    "defaults": {"custom": {"lineWidth": 2, "fillOpacity": 20},
+                                 "min": 0, "max": 1},
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 23,
+                "type": "timeseries",
+                "title": "Edge cache hit ratio by region",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 45},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("edge_cache_hit_ratio", "{{region}}")],
+                "fieldConfig": {
+                    "defaults": {"custom": {"lineWidth": 2}, "unit": "percentunit",
+                                 "min": 0, "max": 1},
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 24,
+                "type": "timeseries",
+                "title": "Segment responses by status class",
+                "description": "A 4xx storm across all regions points at the "
+                               "packager (segment_gap), not any single edge.",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 45},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [{
+                    "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                    "editorMode": "code",
+                    "expr": "sum by (region, status) (rate(segment_status[5m]))",
+                    "legendFormat": "{{region}} {{status}}",
+                    "range": True,
+                    "refId": "A",
+                }],
+                "fieldConfig": {
+                    "defaults": {"custom": {"lineWidth": 2}, "unit": "reqps"},
+                    "overrides": [],
+                },
+            },
             {
                 "id": 15,
                 "type": "logs",
@@ -278,7 +368,7 @@ def dashboard_model():
                     "cardinality guard strips per-segment and per-session "
                     "labels from metrics, and this is where they belong."
                 ),
-                "gridPos": {"h": 10, "w": 12, "x": 12, "y": 25},
+                "gridPos": {"h": 10, "w": 12, "x": 12, "y": 53},
                 "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
                 "targets": [{
                     "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},

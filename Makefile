@@ -24,6 +24,7 @@ ALLOY_UI := http://localhost:12345
 .PHONY: help plant-up plant-down plant-restart plant-status plant-logs \
         set value watch alerts provision tunnel tunnel-url verify \
         player ladder black-source restore-source frame \
+        edges edge-port chaos chaos-clear \
         mcp-up mcp-down clean
 
 help: ## Show available targets
@@ -109,6 +110,48 @@ black-source: ## CHAOS: swap the encoder input to black (every metric stays gree
 restore-source: ## Restore the normal test pattern source
 	$(COMPOSE) up -d --force-recreate encoder
 	@echo "  source restored to testsrc2 + timecode"
+
+# --- L2: edges + chaos ------------------------------------------------------
+# Local port per simulated region. On Cloud Run these become service URLs and
+# only this mapping changes.
+EDGE_PORT_us-east1     := 8081
+EDGE_PORT_europe-west1 := 8082
+EDGE_PORT_asia-south1  := 8083
+REGIONS := us-east1 europe-west1 asia-south1
+
+edges: ## Show each edge's region, chaos state and cache hit ratio
+	@printf "%-16s %-22s %s\n" REGION CHAOS "CACHE HIT RATIO"
+	@for r in $(REGIONS); do \
+	  port=$$($(MAKE) -s edge-port REGION=$$r); \
+	  chaos=$$(curl -sS "http://localhost:$$port/chaos" 2>/dev/null || echo '{}'); \
+	  ratio=$$(curl -sS "http://localhost:$$port/metrics" 2>/dev/null \
+	           | awk -F' ' '/^edge_cache_hit_ratio/ {print $$2}'); \
+	  printf "%-16s %-22s %s\n" "$$r" "$$chaos" "$$ratio"; \
+	done
+
+edge-port: # internal: resolve a region to its local port
+	@echo "$(EDGE_PORT_$(REGION))"
+
+chaos: ## Inject a fault: make chaos REGION=europe-west1 MODE=edge_latency [SEVERITY=2]
+ifndef REGION
+	$(error usage: make chaos REGION=<$(REGIONS)> MODE=<edge_latency|segment_gap|none> [SEVERITY=1-3])
+endif
+ifndef MODE
+	$(error usage: make chaos REGION=$(REGION) MODE=<edge_latency|segment_gap|none> [SEVERITY=1-3])
+endif
+	@port=$(EDGE_PORT_$(REGION)); \
+	if [ -z "$$port" ]; then echo "unknown region '$(REGION)' (known: $(REGIONS))"; exit 1; fi; \
+	curl -sS -X POST "http://localhost:$$port/chaos" \
+	  -H 'Content-Type: application/json' \
+	  -d '{"mode":"$(MODE)","severity":$(or $(SEVERITY),2)}'
+	@echo "  other regions are untouched -- that differential is the point"
+
+chaos-clear: ## Clear injected faults in every region
+	@for r in $(REGIONS); do \
+	  port=$$($(MAKE) -s edge-port REGION=$$r); \
+	  curl -sS -X POST "http://localhost:$$port/chaos" \
+	    -H 'Content-Type: application/json' -d '{"mode":"none","severity":0}'; \
+	done
 
 # --- Grafana Cloud ----------------------------------------------------------
 

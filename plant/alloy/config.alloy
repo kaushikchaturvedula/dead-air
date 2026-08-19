@@ -43,6 +43,38 @@ prometheus.scrape "plant" {
       layer       = "L1",
       component   = "encoder",
     },
+    // L2: the three "CDN" edges.
+    //
+    // Two deliberate choices here:
+    //
+    // 1. No `region` label on the target. Each edge stamps its own region onto
+    //    its metrics; setting it in both places collides and Alloy renames one
+    //    to `exported_region`, quietly splitting every per-region series in two.
+    //
+    // 2. `component` is unique per edge. The relabel rule below pins
+    //    `instance` to `component`, and prometheus.scrape also emits synthetic
+    //    per-target series (`up`, `scrape_duration_seconds`, ...) that carry no
+    //    region. If all three edges shared component="edge" those synthetic
+    //    series would be label-identical across three targets -- duplicate
+    //    samples, rejected by remote_write.
+    {
+      __address__ = "edge-us-east1:8080",
+      job         = "deadair-plant",
+      layer       = "L2",
+      component   = "edge-us-east1",
+    },
+    {
+      __address__ = "edge-europe-west1:8080",
+      job         = "deadair-plant",
+      layer       = "L2",
+      component   = "edge-europe-west1",
+    },
+    {
+      __address__ = "edge-asia-south1:8080",
+      job         = "deadair-plant",
+      layer       = "L2",
+      component   = "edge-asia-south1",
+    },
   ]
 
   forward_to      = [prometheus.relabel.cardinality_guard.receiver]

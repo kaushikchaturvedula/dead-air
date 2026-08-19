@@ -154,6 +154,28 @@ def hop_origin():
     return True
 
 
+EDGE_PORTS = {"us-east1": 8081, "europe-west1": 8082, "asia-south1": 8083}
+
+
+def hop_edges():
+    degraded = []
+    for region, port in sorted(EDGE_PORTS.items()):
+        try:
+            m = scrape(f"http://localhost:{port}/metrics")
+        except Exception as e:
+            print(f"{BAD} edge {region}: :{port} unreachable ({e})")
+            return False
+        key = f'edge_up{{region="{region}"}}'
+        if not m.get(key):
+            print(f"{BAD} edge {region}: not reporting edge_up")
+            return False
+        if m.get(f'edge_chaos_active{{region="{region}"}}'):
+            degraded.append(region)
+    print(f"{OK} edges: {len(EDGE_PORTS)} regions proxying"
+          + (f"  (chaos active: {', '.join(degraded)})" if degraded else ""))
+    return True
+
+
 def hop_alloy():
     try:
         body = get(ALLOY_METRICS, timeout=5)
@@ -229,6 +251,81 @@ def hop_cardinality(env, series):
     return True
 
 
+# Labels each metric MUST still carry once it reaches Mimir. The allowlist in
+# plant/alloy/config.alloy drops anything not named there, and it does so
+# silently -- a metric arrives looking healthy, just without the dimension you
+# needed. That is the same failure shape as a cardinality check that passes
+# because the label was never emitted, so absence of banned labels is only half
+# the assertion; these are the other half.
+EXPECTED_LABELS = [
+    ("deadair_synthetic_gauge", {"job", "instance", "layer", "component"}),
+    ("encoder_fps", {"job", "layer", "component"}),
+    # Without `rendition` you cannot tell which ladder rung stalled, which is
+    # the entire ladder_collapse diagnosis.
+    ("packager_segment_lag", {"rendition"}),
+    # Without `region` there is no per-region differential, which is the entire
+    # edge_latency diagnosis.
+    ("edge_cache_hit_ratio", {"region"}),
+    ("origin_shield_miss_total", {"region"}),
+    ("segment_status", {"region", "status"}),
+    # `le` carries the histogram. Dropping it leaves _bucket series that look
+    # fine individually but make histogram_quantile return nothing.
+    ("segment_ttfb_seconds_bucket", {"region", "le"}),
+]
+
+EXPECTED_REGIONS = {"us-east1", "europe-west1", "asia-south1"}
+
+
+def hop_labels_present(env):
+    ok = True
+    for metric, required in EXPECTED_LABELS:
+        res = promql(env, metric)
+        if not res:
+            print(f"{BAD} labels: {metric} not in Mimir at all")
+            ok = False
+            continue
+        present = set()
+        for s in res:
+            present |= set(s.get("metric", {}))
+        missing = sorted(required - present)
+        if missing:
+            print(f"{BAD} labels: {metric} reached Mimir WITHOUT {missing}")
+            print("       -> the labelkeep allowlist in plant/alloy/config.alloy "
+                  "is dropping it")
+            ok = False
+    if ok:
+        print(f"{OK} labels: all {len(EXPECTED_LABELS)} metrics kept their "
+              "required dimensions")
+
+    # Every region must be reporting, or a 'differential' might just be a dead
+    # edge that stopped emitting rather than a degraded one.
+    res = promql(env, "edge_up")
+    regions = {s["metric"].get("region") for s in (res or [])}
+    missing_regions = sorted(EXPECTED_REGIONS - regions)
+    if missing_regions:
+        print(f"{BAD} regions: not reporting: {missing_regions}")
+        ok = False
+    else:
+        print(f"{OK} regions: all {len(EXPECTED_REGIONS)} edges reporting")
+
+    # A histogram that survives labelwise can still be unusable; check the
+    # query that the dashboard and the agent will actually run.
+    res = promql(
+        env,
+        "histogram_quantile(0.95, sum by (region, le) "
+        "(rate(segment_ttfb_seconds_bucket[5m])))",
+    )
+    if not res:
+        print(f"{BAD} histogram: histogram_quantile returned nothing "
+              "(le present but unusable)")
+        ok = False
+    else:
+        vals = {s["metric"].get("region"): float(s["value"][1]) for s in res}
+        rendered = ", ".join(f"{r}={v * 1000:.0f}ms" for r, v in sorted(vals.items()))
+        print(f"{OK} histogram: p95 TTFB computable per region ({rendered})")
+    return ok
+
+
 def hop_loki(env):
     """Origin access logs queryable in Loki. Reported separately -- a 401 here
     is a credential scope problem, not a broken pipeline."""
@@ -267,6 +364,7 @@ def main():
         ("emitter", hop_emitter()),
         ("encoder", hop_encoder()),
         ("origin", hop_origin()),
+        ("edges", hop_edges()),
         ("alloy", hop_alloy()),
     ]
     if not all(ok for _, ok in required):
@@ -277,6 +375,8 @@ def main():
     if series is None:
         sys.exit(1)
     if not hop_cardinality(env, series):
+        sys.exit(1)
+    if not hop_labels_present(env):
         sys.exit(1)
 
     logs_ok = hop_loki(env)
