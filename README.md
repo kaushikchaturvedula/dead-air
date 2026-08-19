@@ -150,9 +150,32 @@ the dimension, don't label by it. The emitter publishes a deliberate canary
 series tagged `session_id` so `make verify` proves the guard is still stripping
 rather than merely asserting the label is absent.
 
-**Step 2 — L1 encoder (next).** ffmpeg generating a 4-rung ABR HLS ladder with
-burned-in timecode, served by an nginx origin, exporting encoder health metrics
-through the Step 1 pipe.
+**Step 2 — L1 source + encoder (working).** ffmpeg generates a 4-rung ABR HLS
+ladder (1080p/5M · 720p/3M · 480p/1.5M · 360p/800k, 4s segments) with burned-in
+timecode, served by an nginx origin. `encoder_fps`, `dropped_frames` and
+`packager_segment_lag` flow to Mimir; origin access logs flow to Loki.
+
+```bash
+make player     # hls.js player against the local origin
+make ladder     # show the ABR ladder being served
+make frame      # grab the current frame as a PNG
+```
+
+**The demo, runnable now.** Brief §5's headline failure works at L1 already:
+
+```bash
+make black-source     # swap the encoder input to color=black
+make frame            # ...the picture is gone
+make restore-source
+```
+
+With the source black, `encoder_fps` holds 30.0, `dropped_frames` stays 0,
+`encoder_up` stays 1 and segment lag keeps its normal sawtooth. Every delivery
+metric is green while the screen is black — the thesis, on demand, in about
+fifteen seconds.
+
+**Step 3 — L2 edges (next).** Three regional caching proxies with chaos
+endpoints, then the viewer fleet where rebuffer ratio is born.
 
 ## License
 

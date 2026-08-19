@@ -27,11 +27,21 @@ logging {
 
 prometheus.scrape "plant" {
   targets = [
+    // L0 is not a brief layer -- the synthetic emitter is infrastructure that
+    // proves the pipe, kept as a permanent canary (see cardinality guard below).
     {
       __address__ = "emitter:9101",
       job         = "deadair-plant",
       layer       = "L0-synthetic",
       component   = "emitter",
+    },
+    // L1: source + encoder. Exports encoder_fps, dropped_frames and
+    // packager_segment_lag.
+    {
+      __address__ = "encoder:9103",
+      job         = "deadair-plant",
+      layer       = "L1",
+      component   = "encoder",
     },
   ]
 
@@ -68,6 +78,25 @@ prometheus.relabel "cardinality_guard" {
     source_labels = ["component"]
     target_label  = "instance"
   }
+
+  // Allowlist backstop. The brief's rule is "label only by region, rendition,
+  // device_class, status; aggregate across sessions", which is an allowlist --
+  // the denylist above only catches offenders we thought of. Anything not named
+  // here never reaches Mimir, so a future exporter cannot invent a label that
+  // quietly multiplies the series count.
+  //
+  //   __name__            the metric name; dropping it discards the series
+  //   le / quantile       histogram and summary buckets -- REQUIRED. Dropping
+  //                       `le` silently destroys every histogram, which is how
+  //                       L2's segment_ttfb_seconds would break.
+  //   job / instance      structural, bounded
+  //   layer / component   plant topology; a handful of values (beyond the
+  //                       brief's four, but bounded and useful for slicing)
+  //   region / rendition / device_class / status   the brief's four
+  rule {
+    action = "labelkeep"
+    regex  = "__name__|le|quantile|job|instance|layer|component|region|rendition|device_class|status"
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +123,76 @@ prometheus.remote_write "grafana_cloud" {
 
   // `cluster` and `env` are added at write time so every DEAD AIR series is
   // attributable, without each exporter having to know where it runs.
+  external_labels = {
+    project = "dead-air",
+    env     = sys.env("DEADAIR_ENV"),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logs: nginx origin access log -> Grafana Cloud Loki
+// ---------------------------------------------------------------------------
+// This is the other half of the cardinality split. Metrics stay low-cardinality
+// by aggregating across sessions; the per-request detail that was stripped from
+// Mimir lives here, where high-cardinality data belongs. The agent's triage
+// needs both -- "which segment 404'd for whom" is a log question, not a metric
+// question.
+//
+// The same discipline applies to Loki LABELS: a Loki label is as expensive as a
+// Prometheus label. Per-request fields (uri, segment, remote_addr, session)
+// stay in the log LINE, which is indexed cheaply and queryable with LogQL
+// filters. Only bounded values become labels.
+
+local.file_match "origin_access" {
+  path_targets = [
+    {
+      __path__  = "/var/log/deadair/access.log",
+      job       = "deadair-origin",
+      layer     = "L1",
+      component = "origin",
+    },
+  ]
+}
+
+loki.source.file "origin_access" {
+  targets    = local.file_match.origin_access.targets
+  forward_to = [loki.process.origin_access.receiver]
+}
+
+loki.process "origin_access" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  // nginx writes JSON (see plant/origin/nginx.conf), so parse it out for
+  // structured querying...
+  stage.json {
+    expressions = {
+      status   = "status",
+      uri      = "uri",
+      rendition = "rendition",
+    }
+  }
+
+  // ...but promote only bounded fields to labels. `status` is one of a handful
+  // of codes; `rendition` is one of four ladder rungs. `uri` deliberately stays
+  // in the line: one label value per segment filename would be unbounded.
+  stage.labels {
+    values = {
+      status    = "",
+      rendition = "",
+    }
+  }
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_LOKI_URL")
+
+    basic_auth {
+      username = sys.env("GRAFANA_LOKI_USER")
+      password = sys.env("GRAFANA_CLOUD_METRICS_TOKEN")
+    }
+  }
+
   external_labels = {
     project = "dead-air",
     env     = sys.env("DEADAIR_ENV"),

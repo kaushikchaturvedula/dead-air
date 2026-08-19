@@ -93,12 +93,90 @@ only by `session_id` would collapse into duplicate samples once the label is
 correctly dropped, breaking remote_write — the guard would fail in a way that
 looks like a transport bug.
 
-## Step 2 — L1 encoder (next)
+## Step 2 — L1 source + encoder ✅
 
-ffmpeg `-re` with `testsrc2` and burned-in timecode → a 4-rung ABR HLS ladder
-(1080p/5M, 720p/3M, 480p/1.5M, 360p/800k, 4s segments) → nginx origin, with
-`encoder_fps`, `dropped_frames` and `packager_segment_lag` flowing through the
-Step 1 pipe.
+ffmpeg `-re` generating `testsrc2` with a burned-in timecode → 4-rung ABR HLS
+ladder → nginx origin, with encoder health flowing through the Step 1 pipe and
+per-request detail flowing to Loki.
 
-Exit criteria: hls.js plays the ladder in a browser and the encoder metrics are
-visible in Grafana.
+| Piece | Where | Role |
+| --- | --- | --- |
+| Encoder | [plant/encoder/](../plant/encoder/) | ffmpeg supervisor + Prometheus exporter on :9103 |
+| Origin | [plant/origin/](../plant/origin/) | nginx serving HLS on :8080, JSON access log |
+| Player | [plant/origin/player/](../plant/origin/player/) | hls.js with live rendition/buffer/stall readout |
+
+### Verified 2026-08-18
+
+Ladder measured off the wire, not assumed:
+
+| Rung | Resolution | Measured bitrate | Target |
+| --- | --- | --- | --- |
+| 1080p | 1920×1080 | 5186 kbps | 5M |
+| 720p | 1280×720 | 3127 kbps | 3M |
+| 480p | 854×480 | 1591 kbps | 1.5M |
+| 360p | 640×360 | 882 kbps | 800k |
+
+4s segments, one video stream per variant, keyframe-aligned across rungs
+(`-g 120` at 30fps) so a player can switch cleanly. `encoder_fps` holds 30.0
+with 0 dropped frames; `packager_segment_lag` sawtooths 0→4s per rendition.
+Origin access logs are queryable in Loki, labelled `rendition` and `status`.
+
+### Metric naming
+
+L1 metric names come from brief §5 **verbatim and unprefixed** —
+`encoder_fps`, `dropped_frames`, `packager_segment_lag` — because that is how
+§5 and the eventual alert rules name them. The Step 1 synthetic metrics keep a
+`deadair_` prefix (`deadair_synthetic_gauge`, `deadair_cardinality_canary`)
+since they are pipe infrastructure rather than plant signals, and should not be
+mistaken for real telemetry. This inconsistency is deliberate.
+
+### The nginx log trap
+
+`nginx:alpine` ships `/var/log/nginx/access.log` as a **symlink to
+/dev/stdout**. Logging there sends everything to the container's stdout, where
+no file-tailing shipper can reach it — Alloy tails happily and delivers
+nothing, which looks exactly like an authentication failure and sends you
+hunting the wrong problem. The origin therefore logs to `/var/log/deadair/`,
+a plain directory backed by a named volume, with a second `access_log` line to
+stdout so `docker logs` still works.
+
+If the volume was created before this fix, the symlinks were copied into it and
+persist: `docker volume rm dead-air_nginx-logs` and recreate.
+
+## Chaos: `black_source`
+
+Brief §5's headline failure is runnable today, at L1, before the edges exist:
+
+```bash
+make black-source     # swap the encoder input to color=black
+make frame            # grab the current frame -> frames/latest.png
+make restore-source
+```
+
+Verified: with the source black, `encoder_fps` stays 30.0, `dropped_frames`
+stays 0, `encoder_up` stays 1, and `packager_segment_lag` keeps its normal
+sawtooth. **Every delivery metric is green while the picture is gone** — which
+is the entire premise of the project, reproducible on demand in about fifteen
+seconds.
+
+The burned-in timecode keeps running under the black source. That is useful
+rather than incidental: it separates `black_source` (black picture, clock
+running) from a frozen source (static picture, clock stopped) — two failures
+that are identical in delivery telemetry and distinguishable only in the
+pixels. Note the timecode is the *plant's* overlay, applied after the input, so
+a black frame here carries white text rather than being uniformly black.
+
+The encoder reads its input from `ENCODER_SOURCE`, so the swap is a container
+restart rather than a code change — which is what lets L2's chaos endpoint
+drive it later.
+
+## Step 3 — L2 edges + chaos endpoints (next)
+
+3× Cloud Run caching reverse proxies in us-east1 / europe-west1 / asia-south1,
+exporting `edge_cache_hit_ratio`, `segment_status`, `segment_ttfb_seconds`,
+`origin_shield_miss_total`, with `POST /chaos {region, mode, severity}`.
+
+Note for L2: `segment_ttfb_seconds` will be a histogram, and histograms carry a
+`le` label. The cardinality allowlist explicitly permits `le` and `quantile` —
+dropping `le` silently destroys every histogram, which would look like a broken
+exporter rather than a relabel bug.

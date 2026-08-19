@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DEAD AIR — L1 origin player</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 24px;
+    background: #0f1116; color: #e6e6e6;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px; letter-spacing: .08em; text-transform: uppercase; }
+  .sub { color: #8b93a1; margin-bottom: 20px; }
+  .wrap { display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; } }
+  video { width: 100%; background: #000; border-radius: 6px; display: block; }
+  .card { background: #171a21; border: 1px solid #242833; border-radius: 6px; padding: 14px; }
+  .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+             color: #8b93a1; margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 3px 0; }
+  td:last-child { text-align: right; color: #9ecbff; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+         max-height: 200px; overflow-y: auto; color: #8b93a1; }
+  #log div { padding: 1px 0; }
+  .err { color: #ff7b72 !important; }
+  .ok  { color: #7ee787; }
+</style>
+</head>
+<body>
+  <h1>DEAD AIR — L1 origin</h1>
+  <div class="sub">
+    4-rung ABR ladder, 4s segments, burned-in timecode.
+    The timecode is the tell: a frozen source keeps delivering segments while
+    that clock stops.
+  </div>
+
+  <div class="wrap">
+    <div>
+      <video id="v" controls muted autoplay playsinline></video>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:14px">
+        <h2>Playback</h2>
+        <table>
+          <tr><td>State</td><td id="state">loading…</td></tr>
+          <tr><td>Rendition</td><td id="level">—</td></tr>
+          <tr><td>Bitrate</td><td id="bitrate">—</td></tr>
+          <tr><td>Buffer</td><td id="buffer">—</td></tr>
+          <tr><td>Dropped frames</td><td id="dropped">—</td></tr>
+          <tr><td>Stalls</td><td id="stalls">0</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Events</h2>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<script>
+const SRC = '/hls/master.m3u8';
+const v = document.getElementById('v');
+const $ = id => document.getElementById(id);
+let stalls = 0;
+
+function log(msg, cls) {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  el.prepend(d);
+  while (el.childElementCount > 80) el.lastChild.remove();
+}
+
+if (Hls.isSupported()) {
+  const hls = new Hls({ lowLatencyMode: false, enableWorker: true });
+  hls.loadSource(SRC);
+  hls.attachMedia(v);
+
+  hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+    log('manifest parsed — ' + data.levels.length + ' renditions', 'ok');
+    $('state').textContent = 'ready';
+  });
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
+    const lv = hls.levels[data.level];
+    if (!lv) return;
+    $('level').textContent = lv.height + 'p';
+    $('bitrate').textContent = (lv.bitrate / 1e6).toFixed(2) + ' Mbps';
+    log('level switched → ' + lv.height + 'p');
+  });
+  hls.on(Hls.Events.ERROR, (_e, data) => {
+    log('ERROR ' + data.details + (data.fatal ? ' (fatal)' : ''), 'err');
+    if (data.fatal) {
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+    }
+  });
+} else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+  // Safari plays HLS natively.
+  v.src = SRC;
+  log('native HLS playback', 'ok');
+} else {
+  log('HLS not supported in this browser', 'err');
+}
+
+v.addEventListener('playing', () => { $('state').textContent = 'playing'; });
+v.addEventListener('waiting', () => {
+  stalls++; $('stalls').textContent = stalls;
+  $('state').textContent = 'rebuffering';
+  log('BUFFER STALLED', 'err');
+});
+
+// Poll the bits hls.js does not push as events.
+setInterval(() => {
+  if (v.buffered.length) {
+    const ahead = v.buffered.end(v.buffered.length - 1) - v.currentTime;
+    $('buffer').textContent = ahead.toFixed(1) + ' s';
+  }
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+  if (q) $('dropped').textContent = q.droppedVideoFrames;
+}, 500);
+</script>
+</body>
+</html>

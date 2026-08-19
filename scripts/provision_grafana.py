@@ -35,6 +35,7 @@ RULE_UID = "deadair-synthetic-high"
 RULE_GROUP = "deadair-plant"
 CONTACT_POINT = "deadair-local-webhook"
 DATASOURCE_UID = "grafanacloud-prom"
+LOKI_DATASOURCE_UID = "grafanacloud-logs"
 
 # The alert threshold. The emitter starts at 10; `make set VALUE=95` crosses it.
 THRESHOLD = 50
@@ -169,6 +170,124 @@ def dashboard_model():
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
                 "targets": [target("deadair_emitter_up", "{{component}}")],
                 "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}, "overrides": []},
+            },
+
+            # --- L1: source + encoder ---------------------------------------
+            {
+                "id": 10,
+                "type": "row",
+                "title": "L1 — source + encoder",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+                "collapsed": False,
+                "panels": [],
+            },
+            {
+                "id": 11,
+                "type": "timeseries",
+                "title": "encoder_fps",
+                "description": "Realtime encode rate. Sustained drift below the "
+                               "source frame rate means the encoder cannot keep up.",
+                "gridPos": {"h": 8, "w": 8, "x": 0, "y": 17},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("encoder_fps", "fps")],
+                "fieldConfig": {
+                    "defaults": {"custom": {"lineWidth": 2, "fillOpacity": 8},
+                                 "min": 0, "unit": "none"},
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 12,
+                "type": "timeseries",
+                "title": "packager_segment_lag by rendition",
+                "description": (
+                    "Seconds since each ladder rung last produced a segment. "
+                    "Healthy: sawtooths between 0 and the 4s segment duration. "
+                    "A single rung climbing while others stay flat is the "
+                    "ladder_collapse signature."
+                ),
+                "gridPos": {"h": 8, "w": 16, "x": 8, "y": 17},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("packager_segment_lag", "{{rendition}}")],
+                "fieldConfig": {
+                    "defaults": {
+                        "custom": {"lineWidth": 2},
+                        "unit": "s",
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"color": "green", "value": None},
+                                {"color": "red", "value": 15},
+                            ],
+                        },
+                    },
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 13,
+                "type": "stat",
+                "title": "encoder_up",
+                "gridPos": {"h": 5, "w": 6, "x": 0, "y": 25},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("encoder_up", "up")],
+                "fieldConfig": {
+                    "defaults": {
+                        "mappings": [{
+                            "type": "value",
+                            "options": {"0": {"text": "DOWN", "color": "red"},
+                                        "1": {"text": "UP", "color": "green"}},
+                        }],
+                        "color": {"mode": "thresholds"},
+                        "thresholds": {"mode": "absolute", "steps": [
+                            {"color": "red", "value": None},
+                            {"color": "green", "value": 1}]},
+                    },
+                    "overrides": [],
+                },
+                "options": {"colorMode": "background",
+                            "reduceOptions": {"calcs": ["lastNotNull"]}},
+            },
+            {
+                "id": 14,
+                "type": "stat",
+                "title": "dropped_frames",
+                "description": "Cumulative. Any sustained increase means the "
+                               "encoder is shedding frames.",
+                "gridPos": {"h": 5, "w": 6, "x": 6, "y": 25},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("dropped_frames", "dropped")],
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "thresholds"},
+                        "thresholds": {"mode": "absolute", "steps": [
+                            {"color": "green", "value": None},
+                            {"color": "orange", "value": 1}]},
+                    },
+                    "overrides": [],
+                },
+                "options": {"colorMode": "background",
+                            "reduceOptions": {"calcs": ["lastNotNull"]}},
+            },
+            {
+                "id": 15,
+                "type": "logs",
+                "title": "Origin access log (Loki)",
+                "description": (
+                    "Per-request detail lives here, not in Mimir: the "
+                    "cardinality guard strips per-segment and per-session "
+                    "labels from metrics, and this is where they belong."
+                ),
+                "gridPos": {"h": 10, "w": 12, "x": 12, "y": 25},
+                "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
+                "targets": [{
+                    "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
+                    "expr": '{job="deadair-origin"}',
+                    "queryType": "range",
+                    "refId": "A",
+                }],
+                "options": {"showTime": True, "sortOrder": "Descending",
+                            "wrapLogMessage": True},
             },
         ],
     }

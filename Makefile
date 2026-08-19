@@ -16,11 +16,14 @@ PY := ./.venv/bin/python
 ENV_FILE := agents/grafana_probe/.env
 EMITTER := http://localhost:9101
 WEBHOOK := http://localhost:9102
+ENCODER := http://localhost:9103
+ORIGIN := http://localhost:8080
 ALLOY_UI := http://localhost:12345
 
 .DEFAULT_GOAL := help
 .PHONY: help plant-up plant-down plant-restart plant-status plant-logs \
         set value watch alerts provision tunnel tunnel-url verify \
+        player ladder black-source restore-source frame \
         mcp-up mcp-down clean
 
 help: ## Show available targets
@@ -33,6 +36,8 @@ plant-up: $(ENV_FILE) ## Start the plant (emitter, Alloy, webhook, MCP server)
 	$(COMPOSE) up -d --build
 	@echo
 	@echo "  emitter   $(EMITTER)/metrics"
+	@echo "  encoder   $(ENCODER)/metrics"
+	@echo "  player    $(ORIGIN)/player/"
 	@echo "  webhook   $(WEBHOOK)/"
 	@echo "  alloy UI  $(ALLOY_UI)/"
 	@echo
@@ -72,6 +77,38 @@ watch: ## Follow the webhook receiver, waiting for alert deliveries
 
 alerts: ## Show alert deliveries the webhook receiver has seen
 	@curl -sS "$(WEBHOOK)/" || echo "webhook receiver not reachable -- is the plant up?"
+
+# --- L1: encoder / origin ---------------------------------------------------
+
+player: ## Open the hls.js player against the local origin
+	@echo "opening $(ORIGIN)/player/"
+	@open "$(ORIGIN)/player/" 2>/dev/null || echo "browse to $(ORIGIN)/player/"
+
+ladder: ## Show the ABR ladder the origin is currently serving
+	@curl -sS "$(ORIGIN)/hls/master.m3u8"
+
+frame: ## Grab the current frame from the top rung as a PNG (frames/ is gitignored)
+	@mkdir -p frames
+	@seg=$$(curl -sS "$(ORIGIN)/hls/1080p/index.m3u8" | grep -m1 '\.ts$$'); \
+	curl -sS -o /tmp/deadair-frame.ts "$(ORIGIN)/hls/1080p/$$seg"; \
+	ffmpeg -v error -y -i /tmp/deadair-frame.ts -frames:v 1 frames/latest.png; \
+	echo "wrote frames/latest.png (from $$seg)"
+
+# Brief §5 chaos mode `black_source`: the failure the whole demo is built
+# around. Delivery telemetry stays perfectly green -- segments keep flowing at
+# the right size and cadence -- while the picture is gone. The encoder reads its
+# input from ENCODER_SOURCE precisely so this is a restart, not a code change.
+black-source: ## CHAOS: swap the encoder input to black (every metric stays green)
+	ENCODER_SOURCE="color=black:size=1920x1080:rate=30" \
+	  $(COMPOSE) up -d --force-recreate encoder
+	@echo
+	@echo "  source is now BLACK. Metrics will look healthy; the picture is gone."
+	@echo "  compare: make frame     (and watch the dashboard stay green)"
+	@echo "  restore: make restore-source"
+
+restore-source: ## Restore the normal test pattern source
+	$(COMPOSE) up -d --force-recreate encoder
+	@echo "  source restored to testsrc2 + timecode"
 
 # --- Grafana Cloud ----------------------------------------------------------
 

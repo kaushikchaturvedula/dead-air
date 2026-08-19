@@ -50,7 +50,38 @@ services:
       - "127.0.0.1:9101:9101"
     restart: unless-stopped
 
-  # --- Step 1b: collector -> Grafana Cloud Mimir ------------------------------
+  # --- L1: source + encoder (brief §5) ---------------------------------------
+  encoder:
+    build: ./plant/encoder
+    container_name: deadair-encoder
+    environment:
+      # Chaos hook: brief §5's `black_source` mode swaps this for
+      #   color=black:size=1920x1080:rate=30
+      # which is the failure the whole demo is built around. Keeping the source
+      # in the environment means that swap is a restart, not a code change.
+      ENCODER_SOURCE: "${ENCODER_SOURCE:-testsrc2=size=1920x1080:rate=30}"
+      ENCODER_PRESET: "${ENCODER_PRESET:-ultrafast}"
+    volumes:
+      - hls-data:/data/hls
+    ports:
+      - "127.0.0.1:9103:9103"
+    restart: unless-stopped
+
+  # --- L1: HLS origin --------------------------------------------------------
+  origin:
+    build: ./plant/origin
+    container_name: deadair-origin
+    volumes:
+      - hls-data:/data/hls:ro
+      # Shared with Alloy, which tails the access log into Loki.
+      - nginx-logs:/var/log/deadair
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - encoder
+    restart: unless-stopped
+
+  # --- Step 1b: collector -> Grafana Cloud Mimir + Loki -----------------------
   alloy:
     image: grafana/alloy:latest
     container_name: deadair-alloy
@@ -64,6 +95,8 @@ services:
     volumes:
       - ./plant/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - alloy-data:/var/lib/alloy/data
+      # Read-only tail of the origin access log for the Loki pipeline.
+      - nginx-logs:/var/log/deadair:ro
     env_file:
       - agents/grafana_probe/.env
     ports:
@@ -71,6 +104,8 @@ services:
       - "127.0.0.1:12345:12345"
     depends_on:
       - emitter
+      - encoder
+      - origin
     restart: unless-stopped
 
   # --- Step 1d: local alert webhook receiver ---------------------------------
@@ -83,3 +118,5 @@ services:
 
 volumes:
   alloy-data:
+  hls-data:
+  nginx-logs:
