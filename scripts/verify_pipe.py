@@ -176,6 +176,69 @@ def hop_edges():
     return True
 
 
+VIEWERS = "http://localhost:9104/metrics"
+
+
+def hop_viewers():
+    try:
+        m = scrape(VIEWERS)
+    except Exception as e:
+        print(f"{BAD} viewers: :9104 unreachable ({e})")
+        return False
+    sessions = sum(v for k, v in m.items() if k.startswith("viewer_sessions_active"))
+    if sessions <= 0:
+        print(f"{BAD} viewers: no active sessions")
+        return False
+    stalling = sorted(
+        k.split("region=\"")[1].split("\"")[0]
+        for k, v in m.items()
+        if k.startswith("rebuffer_ratio") and v > 0.02
+    )
+    note = f"  (rebuffering: {', '.join(sorted(set(stalling)))})" if stalling else ""
+    print(f"{OK} viewers: {int(sessions)} modeled sessions on a playback clock{note}")
+    return True
+
+
+def hop_beacons(env):
+    """Per-session QoE detail must be in Loki, and session_id must NOT be a
+    Loki label either -- a Loki label costs the same as a Prometheus one."""
+    base = env.get("GRAFANA_URL", "").rstrip("/")
+    token = env.get("GRAFANA_SERVICE_ACCOUNT_TOKEN")
+    if not base or not token:
+        print(f"{WARN} beacons: cannot query (Grafana credentials missing)")
+        return False
+    end = int(time.time() * 1e9)
+    start = end - int(15 * 60 * 1e9)
+    q = urllib.request.quote('{job="deadair-viewers"}')
+    url = (f"{base}/api/datasources/proxy/uid/grafanacloud-logs"
+           f"/loki/api/v1/query_range?query={q}&limit=5&start={start}&end={end}")
+    try:
+        data = json.loads(get(url, token))
+    except Exception as e:
+        print(f"{WARN} beacons: query failed ({e})")
+        return False
+    result = (data.get("data") or {}).get("result") or []
+    if not result:
+        print(f"{WARN} beacons: no QoE beacons in the last 15m")
+        return False
+    stream = result[0].get("stream", {})
+    if "session_id" in stream:
+        print(f"{BAD} beacons: session_id is a LOKI LABEL -- same cardinality "
+              "explosion, different database")
+        return False
+    try:
+        line = json.loads(result[0]["values"][0][1])
+    except Exception:
+        line = {}
+    if "session_id" not in line:
+        print(f"{BAD} beacons: session_id missing from the beacon body -- "
+              "per-session detail is not being captured anywhere")
+        return False
+    print(f"{OK} beacons: per-session QoE in Loki, session_id in the line "
+          f"not the labels (e.g. {line['session_id']})")
+    return True
+
+
 def hop_alloy():
     try:
         body = get(ALLOY_METRICS, timeout=5)
@@ -235,19 +298,32 @@ def hop_cardinality(env, series):
         return False
 
     # The check above is vacuous alone -- deadair_synthetic_gauge never carries
-    # a session_id. The canary does, specifically so the guard has something
+    # a session_id. The canaries do, specifically so the guard has something
     # real to strip. Absence of the label HERE is the actual proof.
-    res = promql(env, "deadair_cardinality_canary")
-    if not res:
-        print(f"{BAD} cardinality: canary not in Mimir yet")
-        return False
-    labels = set(res[0].get("metric", {}))
-    if "session_id" in labels:
-        print(f"{BAD} cardinality: canary arrived WITH session_id -- "
-              "the relabel guard is not stripping per-session labels")
-        return False
-    print(f"{OK} cardinality: canary's session_id stripped en route "
-          f"({len(labels)} labels survive)")
+    #
+    # The L3 canary additionally carries region and device_class, so one series
+    # proves both directions at once: the guard drops what would blow the free
+    # tier and keeps what the diagnosis depends on.
+    for canary, must_keep in (
+        ("deadair_cardinality_canary", set()),
+        ("viewer_cardinality_canary", {"region", "device_class"}),
+    ):
+        res = promql(env, canary)
+        if not res:
+            print(f"{BAD} cardinality: {canary} not in Mimir yet")
+            return False
+        labels = set(res[0].get("metric", {}))
+        if "session_id" in labels:
+            print(f"{BAD} cardinality: {canary} arrived WITH session_id -- "
+                  "the relabel guard is not stripping per-session labels")
+            return False
+        dropped = sorted(must_keep - labels)
+        if dropped:
+            print(f"{BAD} cardinality: {canary} lost {dropped} -- the guard is "
+                  "over-stripping and the diagnosis loses its dimensions")
+            return False
+    print(f"{OK} cardinality: both canaries' session_id stripped en route, "
+          "region/device_class kept")
     return True
 
 
@@ -271,6 +347,11 @@ EXPECTED_LABELS = [
     # `le` carries the histogram. Dropping it leaves _bucket series that look
     # fine individually but make histogram_quantile return nothing.
     ("segment_ttfb_seconds_bucket", {"region", "le"}),
+    # L3. `region` is what the alert splits on and what the agent keys its
+    # investigation off; `device_class` is what shows mobile stalling first.
+    ("rebuffer_ratio", {"region", "device_class"}),
+    ("viewer_rebuffer_seconds_total", {"region", "device_class"}),
+    ("viewer_playing_seconds_total", {"region", "device_class"}),
 ]
 
 EXPECTED_REGIONS = {"us-east1", "europe-west1", "asia-south1"}
@@ -365,6 +446,7 @@ def main():
         ("encoder", hop_encoder()),
         ("origin", hop_origin()),
         ("edges", hop_edges()),
+        ("viewers", hop_viewers()),
         ("alloy", hop_alloy()),
     ]
     if not all(ok for _, ok in required):
@@ -379,7 +461,7 @@ def main():
     if not hop_labels_present(env):
         sys.exit(1)
 
-    logs_ok = hop_loki(env)
+    logs_ok = hop_loki(env) and hop_beacons(env)
 
     print("\nMetrics pipeline healthy end to end.")
     if not logs_ok:

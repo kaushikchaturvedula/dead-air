@@ -75,6 +75,14 @@ prometheus.scrape "plant" {
       layer       = "L2",
       component   = "edge-asia-south1",
     },
+    // L3: viewer fleet. Exports rebuffer_ratio and its underlying counters,
+    // aggregated by region and device_class -- never per session.
+    {
+      __address__ = "viewers:9104",
+      job         = "deadair-plant",
+      layer       = "L3",
+      component   = "viewers",
+    },
   ]
 
   forward_to      = [prometheus.relabel.cardinality_guard.receiver]
@@ -189,6 +197,48 @@ local.file_match "origin_access" {
 loki.source.file "origin_access" {
   targets    = local.file_match.origin_access.targets
   forward_to = [loki.process.origin_access.receiver]
+}
+
+// L3 QoE beacons. This is the other half of the §5 cardinality split: the
+// per-session detail that is deliberately absent from Mimir lives here, with
+// session_id in the log LINE and never as a label.
+local.file_match "viewer_beacons" {
+  path_targets = [
+    {
+      __path__  = "/var/log/deadair/viewers.log",
+      job       = "deadair-viewers",
+      layer     = "L3",
+      component = "viewers",
+    },
+  ]
+}
+
+loki.source.file "viewer_beacons" {
+  targets    = local.file_match.viewer_beacons.targets
+  forward_to = [loki.process.viewer_beacons.receiver]
+}
+
+loki.process "viewer_beacons" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  stage.json {
+    expressions = {
+      region       = "region",
+      device_class = "device_class",
+      rendition    = "rendition",
+    }
+  }
+
+  // Only bounded fields become labels. session_id stays in the line: one label
+  // value per viewer session is precisely the explosion the metrics guard
+  // exists to prevent, and Loki labels are no cheaper than Prometheus ones.
+  stage.labels {
+    values = {
+      region       = "",
+      device_class = "",
+      rendition    = "",
+    }
+  }
 }
 
 loki.process "origin_access" {

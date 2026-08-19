@@ -251,12 +251,118 @@ silently, with data that looks healthy:
 Both assertions were checked against a deliberately broken configuration to
 confirm they actually fail, rather than passing for the wrong reason.
 
-## Step 4 — L3 viewer fleet (next)
+## Step 4 — L3 viewer fleet ✅
 
-~200 modeled clients on a playback clock computing
-`buffer += seg_duration - download_time`, plus real headless Chrome + hls.js
-players, emitting QoE beacons. This is where `rebuffer_ratio` is born, and it
-is what §5's real alert rule watches: `rebuffer_ratio > 0.02 for 2m, by region`.
+**201 modeled sessions** (67 × 3 regions) on a playback clock, running §5's
+buffer model with ABR. This is where `rebuffer_ratio` is born — a client-side
+signal no CDN metric can produce, because only a player knows its buffer
+stalled.
 
-Per-session detail goes to Loki, never to Mimir labels — the split is already
-enforced and proven.
+### Scale, measured not assumed
+
+§5 asks for ~200 clients; 201 runs comfortably here, so no compromise was
+needed. On a 10-core / 8 GB-Docker laptop, alongside the 4-rung 1080p encoder
+and three edges:
+
+| | |
+| --- | --- |
+| Host load average | 6.96 (of 10 cores) |
+| Viewer fleet | 5.4% CPU, 1.18 GB |
+| Each edge | ~1% CPU, ~330 MB |
+| Encoder (dominant cost) | ~120% CPU |
+| **Self-inflicted rebuffering** | **0.000 across all 9 cohorts** |
+
+That last row is the one that matters: the fleet is not starving itself, so the
+rebuffering it reports is the plant's, not the laptop's. It stays cheap because
+the edges serve most segments from cache and the sessions are I/O-bound; ffmpeg
+is the real consumer. Lower `CLIENTS_PER_REGION` on a smaller box — a realistic
+curve from fewer clients beats a starved one from many.
+
+### Buffer model and ABR
+
+```
+buffer += segment_duration - download_time
+buffer <= 0  =>  REBUFFER EVENT, stalled for |buffer| seconds
+```
+
+Device classes hold different buffers (tv 24s, desktop 16s, mobile 10s), so
+mobile stalls first — a split invisible in any CDN metric. Measured under
+`edge_latency` on europe-west1:
+
+| Device class | rebuffer_ratio |
+| --- | --- |
+| mobile | 0.191 |
+| desktop | 0.123 |
+| tv | 0.048 |
+
+Ordered by buffer size, exactly as the physics demands. All three other regions
+sat at 0.000.
+
+Sessions also run simple ABR: a session that cannot fetch a rung faster than
+realtime steps down, and steps back up given headroom. Without it a degraded
+region pins `rebuffer_ratio` near 1.0, which is neither realistic nor
+informative — real players trade quality for continuity, and the *residual*
+rebuffering after they have downshifted is what viewers actually experience.
+
+### Two modeling bugs worth remembering
+
+**Playing time must be unconditional.** Crediting `playing_seconds` only when
+the buffer stayed positive made it stop accumulating the moment a session began
+struggling, pinning `rebuffer_ratio` at exactly 1.000. A segment that arrives
+late still plays its full duration — the viewer stalls, *then* watches it. The
+give-away was a ratio of precisely 1.0 rather than a plausible fraction.
+
+**Latency alone cannot starve a buffer.** 800 ms of added TTFB against a 4s
+segment deadline is comfortably survivable, so a pure-sleep `edge_latency`
+produced no rebuffering at all. Real netem does not behave that way: at high
+RTT, TCP throughput collapses to roughly window/RTT, so a delayed link also
+transfers slowly. The edge therefore shapes throughput as well, calibrated
+against the ladder — severity 2 caps at 600 kbps, *below* the 800k bottom rung,
+so no amount of downshifting rescues it and the rebuffering sustains past a 2m
+alert window.
+
+### The real alert (§5)
+
+`rebuffer_ratio > 0.02 for 2m, by region` — replacing the Step 1 placeholder,
+which `make provision` now deletes.
+
+The query derives the ratio from summed counter rates rather than averaging the
+`rebuffer_ratio` gauge across device classes: averaging weights a handful of
+mobile sessions equally with a large TV cohort, while summed rates weight by
+actual viewing time, which is what a region-level rebuffer ratio means.
+
+`region` is deliberately **not** hardcoded in the rule's labels — it arrives
+from the query's series labels, producing one alert instance per region.
+Verified end to end: one region `Alerting`, two `Normal`, and the webhook
+payload carries `region: europe-west1` in both `commonLabels` and the instance
+labels. The agent keys its entire investigation off that label.
+
+Full lifecycle observed: `inactive → pending → firing` in 2m01s (matching
+`for: 2m`), then `RESOLVED` automatically on `make chaos-clear`.
+
+### Cardinality: both halves proven
+
+| | Metrics (Mimir) | Logs (Loki) |
+| --- | --- | --- |
+| Aggregated by | `region`, `device_class` | — |
+| Per-session detail | never | `session_id` in the log **line** |
+| Proof | `viewer_cardinality_canary` | `hop_beacons` in `make verify` |
+
+The L3 canary is emitted carrying `session_id`, `region` **and**
+`device_class`, so one series proves both directions at once: it arrives in
+Mimir with `session_id` stripped and `region`/`device_class` intact. Over-
+stripping would be as damaging as under-stripping and is now equally caught.
+
+The same discipline applies in Loki — a Loki label costs what a Prometheus one
+does, so `session_id` stays in the beacon body while only bounded fields
+(`region`, `device_class`, `rendition`) become labels. `make verify` asserts
+`session_id` is absent from the stream labels *and* present in the line.
+
+Total active series for the whole plant: **172**, against a ~10k free-tier
+budget.
+
+## Step 5 — cloud deployment (not started, spends credits)
+
+GCE origin first, then the three Cloud Run edges — in that order, because an
+edge needs a publicly reachable origin. Nothing else is blocked on it: the
+entire plant, all four layers, runs locally today.

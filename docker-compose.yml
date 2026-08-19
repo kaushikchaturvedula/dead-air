@@ -124,11 +124,39 @@ services:
       - origin
     restart: unless-stopped
 
-  # Traffic so the per-region differential is observable. A stand-in for L3,
-  # not L3: no playback clock, no buffer model, no rebuffer events.
+  # --- L3: viewer fleet (brief §5) -------------------------------------------
+  # Where rebuffer ratio is born. Metrics are aggregated by region and
+  # device_class only; per-session QoE beacons go to Loki.
+  viewers:
+    build: ./plant/viewers
+    container_name: deadair-viewers
+    environment:
+      EDGES: "us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080"
+      # 67 x 3 regions = 201 sessions, matching §5's "~200 modeled clients".
+      # Measured on a 10-core / 8GB-Docker laptop alongside a 4-rung 1080p
+      # encoder and three edges: load 6.96, 1.2GB, and zero self-inflicted
+      # rebuffering -- the fleet is not starving itself, so the rebuffering it
+      # reports is the plant's, not the laptop's. Lower this if your box is
+      # smaller; a realistic curve from fewer clients beats a starved one.
+      CLIENTS_PER_REGION: "${CLIENTS_PER_REGION:-67}"
+    volumes:
+      # Beacons land next to the origin access log; Alloy tails both.
+      - nginx-logs:/var/log/deadair
+    ports:
+      - "127.0.0.1:9104:9104"
+    depends_on:
+      - edge-us-east1
+      - edge-europe-west1
+      - edge-asia-south1
+    restart: unless-stopped
+
+  # Superseded by the viewer fleet, which generates realistic traffic as a side
+  # effect of modeling playback. Kept for driving the edges without L3:
+  #   docker compose --profile loadgen up -d loadgen
   loadgen:
     build: ./plant/loadgen
     container_name: deadair-loadgen
+    profiles: ["loadgen"]
     environment:
       EDGES: "us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080"
       CLIENTS_PER_EDGE: "${CLIENTS_PER_EDGE:-3}"

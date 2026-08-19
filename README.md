@@ -193,8 +193,33 @@ Latency injection is application-level, not `tc netem`, deliberately: netem
 needs `NET_ADMIN`, which Cloud Run does not grant, so a netem-based mechanism
 would have to be rewritten the moment the edges deploy.
 
-**Step 4 — L3 viewer fleet (next).** ~200 modeled clients on a playback clock,
-where `rebuffer_ratio` is born.
+**Step 4 — L3 viewer fleet (working).** 201 modeled sessions on a playback
+clock running `buffer += segment_duration - download_time`, with ABR and
+per-device buffer sizes. This is where `rebuffer_ratio` is born — a client-side
+signal no CDN metric can produce, because only a player knows its buffer
+stalled.
+
+Degrade one region and the fleet reports it, stratified by device:
+
+| Device class | rebuffer_ratio | |
+| --- | --- | --- |
+| mobile | 0.191 | smallest buffer, stalls first |
+| desktop | 0.123 | |
+| tv | 0.048 | largest buffer, most resilient |
+
+All in `europe-west1`; the other two regions stayed at `0.000`. The real alert
+— `rebuffer_ratio > 0.02 for 2m, by region` — fires for that region alone and
+delivers a webhook carrying `region`, which is what the agent will key its
+investigation off.
+
+**The cardinality split, both halves proven.** Metrics aggregate by `region`
+and `device_class` and never by session; per-session QoE beacons go to Loki
+with `session_id` in the log line, never as a label. A canary carrying
+`session_id`, `region` and `device_class` proves the guard strips the first and
+keeps the other two. Whole plant: **172 active series** against a ~10k budget.
+
+**Step 5 — cloud deployment (not started).** GCE origin, then three Cloud Run
+edges. Nothing is blocked on it — all four layers run locally today.
 
 ### Everything stays local until it has to move
 

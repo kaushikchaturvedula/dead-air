@@ -31,8 +31,10 @@ ENV_PATH = os.path.join(REPO, "agents", "grafana_probe", ".env")
 FOLDER_UID = "deadair"
 FOLDER_TITLE = "DEAD AIR"
 DASHBOARD_UID = "deadair-plant"
-RULE_UID = "deadair-synthetic-high"
+RULE_UID = "deadair-rebuffer-ratio"
 RULE_GROUP = "deadair-plant"
+# The Step 1 placeholder, deleted on provision now that the real signal exists.
+LEGACY_RULE_UIDS = ["deadair-synthetic-high"]
 CONTACT_POINT = "deadair-local-webhook"
 DATASOURCE_UID = "grafanacloud-prom"
 LOKI_DATASOURCE_UID = "grafanacloud-logs"
@@ -359,6 +361,106 @@ def dashboard_model():
                     "overrides": [],
                 },
             },
+            # --- L3: viewer fleet -------------------------------------------
+            {
+                "id": 30,
+                "type": "row",
+                "title": "L3 — viewer fleet (QoE)",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 53},
+                "collapsed": False,
+                "panels": [],
+            },
+            {
+                "id": 31,
+                "type": "timeseries",
+                "title": f"Rebuffer ratio by region (alert > {REBUFFER_THRESHOLD:.0%})",
+                "description": (
+                    "The client-side signal. Rebuffer ratio cannot be measured "
+                    "at the CDN — only a player knows its buffer stalled. This "
+                    "is what the alert watches, and what the agent investigates."
+                ),
+                "gridPos": {"h": 9, "w": 16, "x": 0, "y": 54},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [{
+                    "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                    "editorMode": "code",
+                    "expr": REBUFFER_EXPR,
+                    "legendFormat": "{{region}}",
+                    "range": True,
+                    "refId": "A",
+                }],
+                "fieldConfig": {
+                    "defaults": {
+                        "custom": {"lineWidth": 2, "fillOpacity": 8},
+                        "unit": "percentunit",
+                        "min": 0,
+                        "thresholds": {"mode": "absolute", "steps": [
+                            {"color": "green", "value": None},
+                            {"color": "red", "value": REBUFFER_THRESHOLD}]},
+                    },
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 32,
+                "type": "timeseries",
+                "title": "Delivered bitrate by region (ABR response)",
+                "description": (
+                    "Bitrate falling WITH rebuffering means the link degraded. "
+                    "Bitrate falling WITHOUT rebuffering is ladder_collapse — "
+                    "an encoder rung died and players quietly settled lower."
+                ),
+                "gridPos": {"h": 9, "w": 8, "x": 16, "y": 54},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [{
+                    "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                    "editorMode": "code",
+                    "expr": "avg by (region) (viewer_bitrate_avg)",
+                    "legendFormat": "{{region}}",
+                    "range": True,
+                    "refId": "A",
+                }],
+                "fieldConfig": {
+                    "defaults": {"custom": {"lineWidth": 2}, "unit": "bps", "min": 0},
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 33,
+                "type": "timeseries",
+                "title": "Rebuffer ratio by device class",
+                "description": "Mobile holds the smallest buffer and stalls "
+                               "first — a device-class split that is invisible "
+                               "in any CDN metric.",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 63},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("rebuffer_ratio", "{{region}} / {{device_class}}")],
+                "fieldConfig": {
+                    "defaults": {"custom": {"lineWidth": 2}, "unit": "percentunit",
+                                 "min": 0},
+                    "overrides": [],
+                },
+            },
+            {
+                "id": 34,
+                "type": "logs",
+                "title": "Viewer QoE beacons (Loki)",
+                "description": (
+                    "Per-session detail: session_id, startup time, rebuffer "
+                    "count. Deliberately absent from Mimir — 200 sessions as "
+                    "metric labels would exhaust the free-tier series budget."
+                ),
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 63},
+                "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
+                "targets": [{
+                    "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
+                    "expr": '{job="deadair-viewers"}',
+                    "queryType": "range",
+                    "refId": "A",
+                }],
+                "options": {"showTime": True, "sortOrder": "Descending",
+                            "wrapLogMessage": True},
+            },
             {
                 "id": 15,
                 "type": "logs",
@@ -368,7 +470,7 @@ def dashboard_model():
                     "cardinality guard strips per-segment and per-session "
                     "labels from metrics, and this is where they belong."
                 ),
-                "gridPos": {"h": 10, "w": 12, "x": 12, "y": 53},
+                "gridPos": {"h": 10, "w": 24, "x": 0, "y": 71},
                 "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
                 "targets": [{
                     "datasource": {"type": "loki", "uid": LOKI_DATASOURCE_UID},
@@ -425,27 +527,56 @@ def contact_point_exists(gf):
     return any(c.get("name") == CONTACT_POINT for c in existing)
 
 
+def delete_legacy_rules(gf):
+    for uid in LEGACY_RULE_UIDS:
+        try:
+            gf.request("GET", f"/api/v1/provisioning/alert-rules/{uid}")
+        except RuntimeError:
+            continue
+        gf.request("DELETE", f"/api/v1/provisioning/alert-rules/{uid}")
+        print(f"  removed placeholder rule {uid!r}")
+
+
+# Brief §5: rebuffer_ratio > 0.02 for 2m, BY REGION.
+#
+# Computed from counters rather than averaging the rebuffer_ratio gauge across
+# device classes. Averaging gauges weights a handful of mobile sessions equally
+# with a large TV cohort; deriving the ratio from summed rates weights it by
+# actual viewing time, which is what a region-level rebuffer ratio means.
+REBUFFER_EXPR = (
+    "sum by (region) (rate(viewer_rebuffer_seconds_total[5m])) / "
+    "clamp_min("
+    "  sum by (region) (rate(viewer_rebuffer_seconds_total[5m])) + "
+    "  sum by (region) (rate(viewer_playing_seconds_total[5m]))"
+    ", 0.0001)"
+)
+REBUFFER_THRESHOLD = 0.02
+
+
 def upsert_alert_rule(gf, route_to_webhook):
     rule = {
         "uid": RULE_UID,
-        "title": "DEAD AIR / synthetic gauge high",
+        "title": "DEAD AIR / rebuffer ratio high",
         "condition": "C",
         "folderUID": FOLDER_UID,
         "ruleGroup": RULE_GROUP,
         "noDataState": "NoData",
         "execErrState": "Error",
-        # Short `for` so the Step 1 loop is fast to observe.
-        "for": "1m",
+        "for": "2m",
         "annotations": {
             "summary": (
-                "Synthetic gauge is above "
-                f"{THRESHOLD} -- the DEAD AIR telemetry pipe is working "
-                "end to end."
+                "Viewer rebuffer ratio in {{ $labels.region }} is above "
+                f"{REBUFFER_THRESHOLD:.0%} -- viewers in this region are "
+                "stalling. Rebuffer ratio is a client-side signal; delivery "
+                "telemetry may look healthy."
             ),
             "__dashboardUid__": DASHBOARD_UID,
-            "__panelId__": "1",
+            "__panelId__": "31",
         },
-        "labels": {"project": "dead-air", "layer": "L0-synthetic"},
+        # `region` is NOT hardcoded here -- it arrives from the query's series
+        # labels, giving one alert instance per region. The agent keys its whole
+        # investigation off that label, so it must survive into the payload.
+        "labels": {"project": "dead-air", "layer": "L3"},
         "data": [
             {
                 "refId": "A",
@@ -453,7 +584,7 @@ def upsert_alert_rule(gf, route_to_webhook):
                 "datasourceUid": DATASOURCE_UID,
                 "model": {
                     "refId": "A",
-                    "expr": "deadair_synthetic_gauge",
+                    "expr": REBUFFER_EXPR,
                     "instant": True,
                     "editorMode": "code",
                 },
@@ -480,7 +611,7 @@ def upsert_alert_rule(gf, route_to_webhook):
                     "expression": "B",
                     "conditions": [
                         {
-                            "evaluator": {"type": "gt", "params": [THRESHOLD]},
+                            "evaluator": {"type": "gt", "params": [REBUFFER_THRESHOLD]},
                             "operator": {"type": "and"},
                             "query": {"params": ["B"]},
                             "reducer": {"type": "last", "params": []},
@@ -499,13 +630,14 @@ def upsert_alert_rule(gf, route_to_webhook):
     if route_to_webhook:
         rule["notification_settings"] = {"receiver": CONTACT_POINT}
 
+    desc = f"rebuffer_ratio > {REBUFFER_THRESHOLD} for 2m, by region"
     try:
         gf.request("GET", f"/api/v1/provisioning/alert-rules/{RULE_UID}")
         gf.request("PUT", f"/api/v1/provisioning/alert-rules/{RULE_UID}", rule)
-        print(f"  alert rule {RULE_UID!r} updated (threshold > {THRESHOLD}, for 1m)")
+        print(f"  alert rule {RULE_UID!r} updated ({desc})")
     except RuntimeError:
         gf.request("POST", "/api/v1/provisioning/alert-rules", rule)
-        print(f"  alert rule {RULE_UID!r} created (threshold > {THRESHOLD}, for 1m)")
+        print(f"  alert rule {RULE_UID!r} created ({desc})")
 
     # Tighten evaluation interval so Step 1 is observable in ~1 minute.
     try:
@@ -549,6 +681,7 @@ def main():
             print("    rule will use the default notification policy.")
             print("    run `make tunnel`, then `make provision` to wire the webhook.")
 
+    delete_legacy_rules(gf)
     upsert_alert_rule(gf, route)
     print(f"\ndone. dashboard: {base}/d/{DASHBOARD_UID}")
 

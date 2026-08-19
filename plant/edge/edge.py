@@ -45,15 +45,42 @@ ORIGIN = os.environ.get("ORIGIN_URL", "http://origin:8080").rstrip("/")
 # Segments are immutable once written; manifests are live and must never be
 # cached or players get stuck on a stale segment list.
 SEGMENT_TTL = float(os.environ.get("SEGMENT_CACHE_TTL", "60"))
-MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "400"))
+# Byte budget, not an entry count: a 1080p 4s segment is ~2.5 MB, so a
+# 400-entry cache is a gigabyte per edge and three edges would exhaust the
+# Docker VM. Bound the thing that actually consumes memory.
+MAX_CACHE_BYTES = int(os.environ.get("MAX_CACHE_BYTES", str(192 * 1024 * 1024)))
 
-# Mirrors §5's `tc netem delay 800ms 200ms`: (delay, jitter) in seconds.
-LATENCY_BY_SEVERITY = {1: (0.200, 0.050), 2: (0.800, 0.200), 3: (2.000, 0.500)}
+# Chaos severity -> (ttfb delay, jitter, throughput cap in bits/sec).
+#
+# §5 specifies `tc netem delay 800ms 200ms`. Reproducing only the delay would
+# understate netem badly: at a high RTT, TCP throughput collapses to roughly
+# window/RTT, so a netem-delayed edge does not just answer late, it transfers
+# slowly. Latency alone would never starve a 4s-segment buffer -- 800ms of
+# added TTFB against a 4s deadline is comfortably survivable -- and the
+# edge_latency fault would produce no rebuffering at all, which is not what
+# netem does on a real link. The throughput cap is what makes this fault
+# behave like the real thing.
+# Throughput caps are calibrated against the ladder (5M/3M/1.5M/800k):
+#   sev 1  4 Mbps  -- between the 1080p and 720p rungs: ABR downshifts and
+#                     absorbs it. Quality drops, viewers do not stall.
+#   sev 2  600 kbps -- BELOW the 800k bottom rung, so no amount of downshifting
+#                     rescues it and rebuffering is sustained. This is the
+#                     default because a fault a player can adapt around does not
+#                     stay above a 2m alert threshold, and an edge degraded
+#                     below the bottom rung is exactly the real-world case the
+#                     agent must diagnose.
+#   sev 3  250 kbps -- severe.
+LATENCY_BY_SEVERITY = {
+    1: (0.200, 0.050, 4_000_000),
+    2: (0.800, 0.200, 600_000),
+    3: (2.000, 0.500, 250_000),
+}
 
 TTFB_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
 
 _lock = threading.Lock()
 _cache = OrderedDict()          # path -> (expiry, status, body, content_type)
+_cache_bytes = 0
 _chaos = {"mode": "none", "severity": 0}
 _seq = 0                        # request counter, drives segment_gap
 
@@ -149,15 +176,36 @@ def render_metrics():
 
 
 def apply_chaos_delay():
-    """Application-level stand-in for `tc netem delay`."""
+    """TTFB component of edge_latency -- the stand-in for `tc netem delay`."""
     with _lock:
         mode, severity = _chaos["mode"], _chaos["severity"]
     if mode != "edge_latency":
         return 0.0
-    delay, jitter = LATENCY_BY_SEVERITY.get(severity, LATENCY_BY_SEVERITY[2])
+    delay, jitter, _bps = LATENCY_BY_SEVERITY.get(severity, LATENCY_BY_SEVERITY[2])
     actual = max(0.0, random.gauss(delay, jitter / 2))
     time.sleep(actual)
     return actual
+
+
+def apply_chaos_throughput(nbytes):
+    """Throughput component of edge_latency -- what makes buffers actually drain.
+
+    Applied after TTFB is recorded, so segment_ttfb_seconds keeps meaning
+    'time to first byte' while the viewer's measured download time reflects
+    the degraded transfer rate.
+    """
+    with _lock:
+        mode, severity = _chaos["mode"], _chaos["severity"]
+    if mode != "edge_latency" or not nbytes:
+        return 0.0
+    _d, _j, bps = LATENCY_BY_SEVERITY.get(severity, LATENCY_BY_SEVERITY[2])
+    if bps <= 0:
+        return 0.0
+    seconds = (nbytes * 8) / bps
+    # Cap so a single request cannot pin a server thread indefinitely.
+    seconds = min(seconds, 30.0)
+    time.sleep(seconds)
+    return seconds
 
 
 def should_drop(path):
@@ -193,6 +241,7 @@ def fetch_origin(path):
 
 
 def cache_get(path):
+    global _cache_bytes
     with _lock:
         entry = _cache.get(path)
         if not entry:
@@ -200,6 +249,7 @@ def cache_get(path):
         expiry, status, body, ctype = entry
         if time.time() > expiry:
             _cache.pop(path, None)
+            _cache_bytes -= len(body)
             return None
         _cache.move_to_end(path)
         return status, body, ctype
@@ -208,10 +258,16 @@ def cache_get(path):
 def cache_put(path, status, body, ctype):
     if not path.endswith(".ts") or status != 200:
         return          # only immutable segments are cached
+    global _cache_bytes
     with _lock:
+        prev = _cache.pop(path, None)
+        if prev:
+            _cache_bytes -= len(prev[2])
         _cache[path] = (time.time() + SEGMENT_TTL, status, body, ctype)
-        while len(_cache) > MAX_CACHE_ENTRIES:
-            _cache.popitem(last=False)
+        _cache_bytes += len(body)
+        while _cache_bytes > MAX_CACHE_BYTES and _cache:
+            _, evicted = _cache.popitem(last=False)
+            _cache_bytes -= len(evicted[2])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -274,10 +330,14 @@ class Handler(BaseHTTPRequestHandler):
             cache_state = "MISS"
 
         record_status(status)
+        # TTFB is recorded before throughput shaping so the metric keeps its
+        # meaning; the client's total download time carries the transfer cost.
         observe_ttfb(time.time() - started)
+        shaped = apply_chaos_throughput(len(body))
         self._send(status, body, ctype, extra={
             "X-Cache": cache_state,
             "X-Deadair-Injected-Delay": f"{injected:.3f}",
+            "X-Deadair-Shaped-Seconds": f"{shaped:.3f}",
         })
 
     def do_POST(self):
