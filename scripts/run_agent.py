@@ -49,6 +49,19 @@ from dead_air.agent import root_agent                            # noqa: E402
 WEBHOOK = os.environ.get("DEADAIR_WEBHOOK", "http://localhost:9102")
 APP_NAME = "dead_air"
 
+# Hard wall-clock ceiling on a single investigation. Backoff and per-call
+# timeouts are bounded elsewhere, but this is the backstop that guarantees the
+# agent either finishes or FAILS -- it never hangs.
+#
+# That distinction is a demo risk before it is an eval risk: on camera, an agent
+# that errors can be retried in fifteen seconds, while an agent that hangs is
+# unrecoverable. Prefer a loud failure.
+RUN_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_RUN_TIMEOUT", "900"))
+
+
+class AgentRunTimeout(RuntimeError):
+    """Raised when an investigation exceeds its wall-clock budget."""
+
 
 def _get(url, timeout=10):
     with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -72,7 +85,23 @@ def alert_state(payload):
     }
 
 
-async def run_once(state, quiet=False):
+async def run_once(state, quiet=False, timeout=None):
+    """Run one investigation, bounded by a hard wall-clock timeout."""
+    timeout = RUN_TIMEOUT_SECONDS if timeout is None else timeout
+    started = time.monotonic()
+    try:
+        return await asyncio.wait_for(
+            _run_once_inner(state, quiet, started), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise AgentRunTimeout(
+            f"investigation exceeded {timeout:.0f}s and was aborted "
+            f"(region={state.get('alert_region')}, "
+            f"trigger={state.get('trigger_kind')}). This is a hard ceiling, "
+            f"not a retry -- something stalled rather than merely being slow."
+        ) from None
+
+
+async def _run_once_inner(state, quiet, started):
     session_service = InMemorySessionService()
     runner = Runner(agent=root_agent, app_name=APP_NAME,
                     session_service=session_service)
@@ -119,7 +148,11 @@ async def run_once(state, quiet=False):
 
     final = await session_service.get_session(
         app_name=APP_NAME, user_id="alertmanager", session_id=session.id)
-    return final.state
+    elapsed = time.monotonic() - started
+    print(f"  [done] investigation completed in {elapsed:.1f}s", flush=True)
+    st = dict(final.state)
+    st["_elapsed_seconds"] = round(elapsed, 1)
+    return st
 
 
 def show(state):
@@ -203,6 +236,9 @@ def main():
     ap.add_argument("--interval", type=int, default=300,
                     help="seconds between sweeps")
     ap.add_argument("--json", help="write final session state here")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help=f"hard ceiling per run in seconds "
+                         f"(default {RUN_TIMEOUT_SECONDS:.0f})")
     args = ap.parse_args()
 
     if args.sweep:
@@ -224,7 +260,7 @@ def main():
         "alert_status": "firing",
         "trigger_kind": "manual",
     }
-    final = asyncio.run(run_once(state))
+    final = asyncio.run(run_once(state, timeout=args.timeout))
     show(final)
     if args.json:
         with open(args.json, "w") as fh:

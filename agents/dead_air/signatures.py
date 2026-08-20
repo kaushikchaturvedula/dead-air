@@ -134,13 +134,28 @@ def _ttfb_elevated_regions(ev):
             if v and v > TTFB_ELEVATED_SECONDS]
 
 
+# Values that mean "we did not actually look", as opposed to "we looked and saw
+# this". Treating them as observations is how a skipped Phase 2 turns into a
+# false elimination.
+_NO_FRAME_EVIDENCE = {None, "", "no_frame_available"}
+_NO_RUNG_EVIDENCE = {None, "", "not_checked", "inconclusive"}
+
+
 def _visual(ev, key):
     v = ev.get("visual") or {}
     return v.get(key)
 
 
-def _visual_available(ev):
-    return bool(ev.get("visual"))
+def _frame_evidence(ev):
+    """The frame verdict, or None when no frame was actually inspected."""
+    val = _visual(ev, "frame_verdict")
+    return None if val in _NO_FRAME_EVIDENCE else val
+
+
+def _rung_evidence(ev):
+    """The rung measurement, or None when it was never taken."""
+    val = _visual(ev, "rung_resolution_verdict")
+    return None if val in _NO_RUNG_EVIDENCE else val
 
 
 # --- the library -----------------------------------------------------------
@@ -218,12 +233,12 @@ SIGNATURES = [
         diagnosis="source blackout -- the encoder is healthy but the picture is gone",
         checks=[
             Check("frame inspection reports a black picture",
-                  lambda ev: (_visual(ev, "frame_verdict") == "black_frame"
-                              if _visual_available(ev) else None),
+                  lambda ev: (_frame_evidence(ev) == "black_frame"
+                              if _frame_evidence(ev) is not None else None),
                   required=True),
             Check("burned-in timecode still legible (encoder alive, source dead)",
                   lambda ev: (bool(_visual(ev, "timecode_legible"))
-                              if _visual_available(ev) else None)),
+                              if _frame_evidence(ev) is not None else None)),
             Check("delivery metrics show no degradation at all",
                   lambda ev: len(_rebuffering_regions(ev)) == 0
                              and len(_bitrate_degraded_regions(ev)) == 0
@@ -240,13 +255,12 @@ SIGNATURES = [
             # Deterministic measurement only. Vision cannot see this fault and is
             # never consulted for it (docs/vision-spike.md).
             Check("rung resolution measurement reports the top rung as upscaled",
-                  lambda ev: (_visual(ev, "rung_resolution_verdict")
-                              == "suspect_upscaled"
-                              if _visual_available(ev) else None),
+                  lambda ev: (_rung_evidence(ev) == "suspect_upscaled"
+                              if _rung_evidence(ev) is not None else None),
                   required=True),
             Check("frame itself looks healthy -- the fault is invisible to vision",
-                  lambda ev: (_visual(ev, "frame_verdict") == "healthy"
-                              if _visual_available(ev) else None)),
+                  lambda ev: (_frame_evidence(ev) == "healthy"
+                              if _frame_evidence(ev) is not None else None)),
             Check("delivery metrics show no degradation at all",
                   lambda ev: len(_rebuffering_regions(ev)) == 0
                              and len(_bitrate_degraded_regions(ev)) == 0
@@ -273,12 +287,11 @@ HEALTHY = Signature(
               lambda ev: bool(ev.get("encoder_up")) and
                          ev.get("rungs_active", 0) >= 4, required=True),
         Check("frame inspection found no picture fault",
-              lambda ev: (_visual(ev, "frame_verdict") == "healthy"
-                          if _visual_available(ev) else None)),
+              lambda ev: (_frame_evidence(ev) == "healthy"
+                          if _frame_evidence(ev) is not None else None)),
         Check("rung resolution measurement clean",
-              lambda ev: (_visual(ev, "rung_resolution_verdict")
-                          == "carries_expected_detail"
-                          if _visual_available(ev) else None)),
+              lambda ev: (_rung_evidence(ev) == "carries_expected_detail"
+                          if _rung_evidence(ev) is not None else None)),
     ],
 )
 

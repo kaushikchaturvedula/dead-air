@@ -28,10 +28,20 @@ MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 
 # Settled by docs/vision-spike.md: gemini-3.7-flash is the only tier with a zero
 # false-positive rate on healthy frames, and no higher tier is used anywhere.
+# Deliberately SMALL. An earlier config (5 attempts, 60s max delay) meant a
+# single throttled call could burn ~62s before failing, and a phase making
+# dozens of calls could sleep for tens of minutes. One evaluation case ran 128
+# minutes against a ~54 minute average for its peers -- not slowness, a stall.
+#
+# This is a DEMO risk before it is an eval risk: mid-recording, an agent that
+# hangs is unrecoverable on camera, while an agent that errors can be retried.
+# Fail fast and loudly, and let the caller decide.
+#
+# Worst case per call now: 1 + 2 + 4 = 7s of backoff across 3 attempts.
 RETRY = types.HttpRetryOptions(
-    attempts=5,
-    initial_delay=2.0,
-    max_delay=60.0,
+    attempts=3,
+    initial_delay=1.0,
+    max_delay=8.0,
     exp_base=2.0,
     jitter=0.3,
     # 429 is the one that actually bites; the 5xx codes are cheap insurance.

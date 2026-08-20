@@ -45,10 +45,22 @@ LOKI_UID = "grafanacloud-logs"
 TEMPO_UID = "grafanacloud-traces"
 
 
+# Bounded so one unresponsive call cannot stall a whole phase. The library
+# defaults are timeout=5s but sse_read_timeout=300s -- five minutes per read,
+# multiplied by four parallel specialists making several calls each, which is
+# how an investigation quietly turns into a hang instead of an error.
+MCP_CONNECT_TIMEOUT = float(os.environ.get("MCP_CONNECT_TIMEOUT", "10"))
+MCP_READ_TIMEOUT = float(os.environ.get("MCP_READ_TIMEOUT", "60"))
+
+
 def _toolset(tool_names):
     """One MCP connection, filtered to an explicit tool list."""
     return McpToolset(
-        connection_params=StreamableHTTPConnectionParams(url=GRAFANA_MCP_URL),
+        connection_params=StreamableHTTPConnectionParams(
+            url=GRAFANA_MCP_URL,
+            timeout=MCP_CONNECT_TIMEOUT,
+            sse_read_timeout=MCP_READ_TIMEOUT,
+        ),
         tool_filter=list(tool_names),
     )
 
