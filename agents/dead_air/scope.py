@@ -36,7 +36,9 @@ from google.adk.tools.mcp_tool.mcp_session_manager import (
 from .schemas import IncidentScope
 
 GRAFANA_MCP_URL = os.environ.get("GRAFANA_MCP_URL", "http://localhost:8010/mcp")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+# Shared factory: one tier decision, one retry policy. See model.py for why
+# backoff is mandatory given the ParallelAgent fan-out.
+from .model import build_model
 
 PROM_UID = "grafanacloud-prom"
 LOKI_UID = "grafanacloud-logs"
@@ -120,7 +122,7 @@ Rules that override anything else:
 
 metrics_agent = LlmAgent(
     name="scope_metrics",
-    model=MODEL,
+    model=build_model(),
     description="Queries Mimir for the metric shape of the incident.",
     instruction=f"""\
 You are the metrics specialist for a live video streaming plant.
@@ -167,7 +169,7 @@ cannot see, and it is what tells the next phase to go and look at pixels.
 
 logs_agent = LlmAgent(
     name="scope_logs",
-    model=MODEL,
+    model=build_model(),
     description="Queries Loki for origin and viewer log evidence.",
     instruction=f"""\
 You are the logs specialist for a live video streaming plant.
@@ -208,7 +210,7 @@ Quote actual log lines as evidence.
 
 traces_agent = LlmAgent(
     name="scope_traces",
-    model=MODEL,
+    model=build_model(),
     description="Queries Tempo for request-path latency attribution.",
     instruction=f"""\
 You are the traces specialist for a live video streaming plant.
@@ -247,7 +249,7 @@ evidence of a problem. Say so rather than reading significance into it.
 
 dashboard_agent = LlmAgent(
     name="scope_dashboards",
-    model=MODEL,
+    model=build_model(),
     description="Locates the operator-facing dashboards for this incident.",
     instruction=f"""\
 You are the dashboard specialist for a live video streaming plant.
@@ -279,7 +281,7 @@ scope_fanout = ParallelAgent(
 # separate step that reads the specialists' findings out of session state.
 scope_synthesizer = LlmAgent(
     name="scope_synthesizer",
-    model=MODEL,
+    model=build_model(),
     description="Folds the four specialist reports into one IncidentScope.",
     instruction="""\
 You are the incident commander for a live video streaming plant. Four

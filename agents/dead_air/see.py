@@ -22,11 +22,13 @@ from google.adk.agents import LlmAgent, SequentialAgent
 from .schemas import VisualFinding
 from .video_tools import check_rung_resolution, get_stream_manifest, inspect_frame
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+# Shared factory: one tier decision, one retry policy. See model.py for why
+# backoff is mandatory given the ParallelAgent fan-out.
+from .model import build_model
 
 see_investigator = LlmAgent(
     name="see_investigator",
-    model=MODEL,
+    model=build_model(),
     description="Fetches real segments from the plant and inspects the picture.",
     instruction="""\
 You inspect what viewers are actually seeing in a live video stream.
@@ -75,7 +77,7 @@ guess at what it would have shown.""",
 
 see_synthesizer = LlmAgent(
     name="see_synthesizer",
-    model=MODEL,
+    model=build_model(),
     description="Turns the visual investigation into a VisualFinding.",
     instruction="""\
 Produce a single VisualFinding from the investigation below.

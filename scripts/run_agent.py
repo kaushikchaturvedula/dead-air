@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Wake the DEAD AIR agent from a Grafana alert.
 
-Two modes:
+THREE ENTRY POINTS, ONE PIPELINE
+--------------------------------
+    --watch                   REACTIVE. Poll the webhook receiver and run once
+                              per new firing alert.
+    --sweep                   PROACTIVE. The confidence monitor: run on a timer
+                              regardless of alerts, always inspecting pixels.
+    --region europe-west1     run once (manual / testing)
 
-    --region europe-west1     run once against a region (manual / testing)
-    --watch                   poll the local webhook receiver and run the agent
-                              each time a NEW alert fires
+The proactive sweep is first-class, not a fallback. black_source moves no
+metric, so no alert can ever fire for it -- an alert-driven agent sleeps through
+the fault this project exists to catch. Real broadcast operations run a
+confidence monitor watching the output continuously for exactly this reason.
 
 The webhook receiver (plant/webhook/receiver.py) is a dependency-free container
 and deliberately stays that way -- it records alert deliveries and nothing else.
@@ -61,6 +68,7 @@ def alert_state(payload):
         "alert_time": (alerts[0].get("startsAt") if alerts else "") or "",
         "alert_summary": annotations.get("summary", ""),
         "alert_status": payload.get("status", "unknown"),
+        "trigger_kind": "alert",
     }
 
 
@@ -71,14 +79,25 @@ async def run_once(state, quiet=False):
     session = await session_service.create_session(
         app_name=APP_NAME, user_id="alertmanager", state=state)
 
-    kickoff = (
-        f"Alert {state['alert_name']} is {state['alert_status']} for region "
-        f"{state['alert_region']}. {state['alert_summary']} "
-        "Scope the incident, then inspect what viewers are actually seeing."
-    )
+    if state.get("trigger_kind") == "sweep":
+        kickoff = (
+            f"Scheduled confidence sweep of region {state['alert_region']}. "
+            "No alert has fired. Establish the plant's current state, then "
+            "inspect what viewers are actually seeing -- a source blackout or a "
+            "ladder mismatch moves no delivery metric and can only be found by "
+            "looking. Then diagnose."
+        )
+    else:
+        kickoff = (
+            f"Alert {state['alert_name']} is {state['alert_status']} for region "
+            f"{state['alert_region']}. {state['alert_summary']} "
+            "Scope the incident, inspect what viewers are seeing if telemetry "
+            "cannot discriminate, then diagnose."
+        )
     message = types.Content(role="user", parts=[types.Part(text=kickoff)])
 
-    print(f"\n{'=' * 78}\nDEAD AIR woke: {state['alert_name']} / "
+    kind = "SWEEP" if state.get("trigger_kind") == "sweep" else "ALERT"
+    print(f"\n{'=' * 78}\nDEAD AIR woke [{kind}]: {state['alert_name']} / "
           f"{state['alert_region']}\n{'=' * 78}", flush=True)
 
     async for event in runner.run_async(
@@ -105,7 +124,8 @@ async def run_once(state, quiet=False):
 
 def show(state):
     for key, title in (("incident_scope", "PHASE 1 -- INCIDENT SCOPE"),
-                       ("visual_finding", "PHASE 2 -- VISUAL FINDING")):
+                       ("visual_finding", "PHASE 2 -- VISUAL FINDING"),
+                       ("diagnosis", "PHASE 3 -- DIAGNOSIS")):
         raw = state.get(key)
         print(f"\n{'-' * 78}\n{title}\n{'-' * 78}")
         if not raw:
@@ -150,6 +170,27 @@ def watch(poll_seconds):
         time.sleep(poll_seconds)
 
 
+def sweep(interval, region):
+    """The confidence monitor: proactive, on a timer, always inspects pixels."""
+    print(f"confidence monitor: sweeping {region} every {interval}s "
+          f"(vision always runs on this path)", flush=True)
+    while True:
+        state = {
+            "alert_name": "DEAD AIR / scheduled confidence sweep",
+            "alert_region": region,
+            "alert_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "alert_summary": "Proactive content check. No alert has fired.",
+            "alert_status": "sweep",
+            "trigger_kind": "sweep",
+        }
+        try:
+            final = asyncio.run(run_once(state))
+            show(final)
+        except Exception as e:
+            print(f"  sweep error: {type(e).__name__}: {e}", flush=True)
+        time.sleep(interval)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", help="run once for this region")
@@ -157,8 +198,16 @@ def main():
     ap.add_argument("--watch", action="store_true",
                     help="poll the webhook receiver and run on each new alert")
     ap.add_argument("--poll", type=int, default=15)
+    ap.add_argument("--sweep", action="store_true",
+                    help="proactive confidence monitor: run on a timer")
+    ap.add_argument("--interval", type=int, default=300,
+                    help="seconds between sweeps")
     ap.add_argument("--json", help="write final session state here")
     args = ap.parse_args()
+
+    if args.sweep:
+        sweep(args.interval, args.region or "us-east1")
+        return
 
     if args.watch:
         watch(args.poll)
@@ -173,6 +222,7 @@ def main():
         "alert_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "alert_summary": f"Manual trigger for {args.region}.",
         "alert_status": "firing",
+        "trigger_kind": "manual",
     }
     final = asyncio.run(run_once(state))
     show(final)

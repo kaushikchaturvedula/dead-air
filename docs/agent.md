@@ -1,4 +1,4 @@
-# The DEAD AIR agent — Phases 1–2
+# The DEAD AIR agent — Phases 1–3
 
 ```
 root  SequentialAgent
@@ -9,10 +9,38 @@ root  SequentialAgent
 │   │   ├── scope_traces       Tempo       2 MCP tools
 │   │   └── scope_dashboards   Grafana     3 MCP tools
 │   └── scope_synthesizer  →  IncidentScope   (schema-validated)
-└── phase2_see  SequentialAgent
-    ├── see_investigator   manifest · frames · vision · rung check
-    └── see_synthesizer    →  VisualFinding   (schema-validated)
+├── phase2_see  SequentialAgent          [conditional]
+│   ├── see_investigator   manifest · frames · vision · rung check
+│   └── see_synthesizer    →  VisualFinding   (schema-validated)
+└── phase3_diagnose  SequentialAgent
+    ├── diagnose_investigator  ranks, then runs the deterministic checklist
+    └── diagnose_synthesizer   →  Diagnosis     (schema-validated)
 ```
+
+## Two triggers, one pipeline
+
+Both are first-class. Neither is a workaround for the other.
+
+| Trigger | Wakes on | Phase 2 |
+| --- | --- | --- |
+| **Reactive** — `make agent-watch` | a Grafana alert webhook | only if `needs_visual_inspection` |
+| **Proactive** — `make agent-sweep` | a timer, no alert needed | **always** |
+
+The proactive sweep exists because of a measured fact: `black_source` moves no
+metric, so no threshold is crossed and no alert can ever fire. An alert-driven
+agent sleeps through the one fault this project is built around.
+
+It is also what real broadcast operations run. A confidence monitor watches the
+output continuously; it is not woken by delivery thresholds. That makes the
+thesis self-consistent — the agent finds dead air **because it is looking**, not
+because telemetry told it to, which is the whole point given telemetry cannot
+see it.
+
+Phase 2 is skipped on the reactive path when Phase 1 sets
+`needs_visual_inspection: false` — a regional edge fault is already
+discriminated by telemetry, so fetching frames costs a vision call and changes
+nothing. When it is skipped, `black_source` and `ladder_mismatch` are reported
+as **unconfirmable**, never as ruled out.
 
 Model: `gemini-3.7-flash`, `location=global`, everywhere. Settled by
 [the vision spike](vision-spike.md); no higher tier is used anywhere, including
@@ -145,7 +173,66 @@ exists to separate.
 black frame and correctly reported `carries_expected_detail` (ratio 0.973), so
 `ladder_mismatch` was eliminated by measurement rather than by omission.
 
-## Known gap: `black_source` fires no alert
+## Phase 3 — DIAGNOSE
+
+    Gemini    ranks which hypotheses are worth testing, and explains the result
+    code      runs the confirming checks and computes the verdict
+    evidence  decides
+
+The model does not conclude. It calls `match_fault_signatures`, which collects
+evidence with **fixed PromQL** and evaluates every fault's checklist
+([signatures.py](../agents/dead_air/signatures.py)), returning a computed
+verdict. The model explains it, and if it disagrees it must say so explicitly in
+`disagreement_note` rather than quietly substituting its own answer. A recorded
+disagreement is debuggable; a silent override is not.
+
+The checklists reproduce the table measured by
+[`scripts/fault_signatures.py`](../scripts/fault_signatures.py). That harness is
+the ground truth — if the predicates and the table ever disagree, the table is
+right and the predicates are wrong.
+
+### The 404 discriminator
+
+`ladder_collapse` and `segment_gap` **both** produce 404s. Presence does not
+separate them; persistence does:
+
+| `fourxx_status` | Meaning | Fault |
+| --- | --- | --- |
+| `ongoing` | segments still being deleted | `segment_gap` |
+| `stopped` | a burst died out as players re-read the manifest | `ladder_collapse` |
+| `none` | no 404 activity in either window | neither |
+
+Computed in code from two non-overlapping windows — `rate[3m]` versus
+`rate[3m] offset 8m` — because this is exactly the query a model gets subtly
+wrong, and getting it wrong swaps one diagnosis for the other.
+
+### Missing evidence is never elimination
+
+A fault whose required checks cannot be evaluated comes back **`unconfirmable`**,
+not `ruled_out`, and the schema keeps those in separate fields. When Phase 2 is
+skipped, `black_source` and `ladder_mismatch` are unconfirmable — telemetry
+alone cannot eliminate them. Conflating the two is how an agent reports false
+certainty.
+
+### Verified: 6/6
+
+```bash
+make diagnose-checks    # fast: deterministic checklist only, no model calls
+make diagnose-eval      # full: all 5 faults + healthy control through the agent
+```
+
+Each case is injected into the live plant, given time for remote_write to catch
+up, then scored against ground truth.
+
+**One bug this caught.** The first run scored a *healthy* plant as faulty. The
+bitrate threshold was 4.5 Mbps and `europe-west1` read 4.09 Mbps — not degraded,
+just still climbing back up the ladder after the previous test's ABR downshift.
+ABR recovery is gradual, so "recovering" looked identical to "broken". The
+threshold now sits at 3.0 Mbps, in the empty space between recovering-healthy
+(4.1–5.0) and actually-degraded (0.8–2.0), and the harness lets ABR settle for
+120s between cases.
+
+## Known gap (now closed by the sweep): `black_source` fires no alert
 
 **The fault the whole demo is built around cannot wake the agent through the
 alert path.** This is not a defect in the alerting — it is the premise, working:

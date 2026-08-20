@@ -133,3 +133,60 @@ class VisualFinding(BaseModel):
                     "the every-dashboard-green-and-the-screen-is-black case.")
     visual_summary: str
     suspected_fault: FaultLabel = "unknown"
+
+
+class Diagnosis(BaseModel):
+    """Phase 3 output: which fault, and the evidence that decided it.
+
+    The deterministic checklist in signatures.py computes the verdict; this
+    object records it alongside the model's ranking and explanation. When the
+    two disagree the disagreement is recorded rather than resolved silently --
+    an agent that quietly overrules its own evidence is worse than one that
+    admits confusion.
+    """
+
+    fault: FaultLabel
+    diagnosis: str = Field(
+        description="What is actually wrong, in an operator's language.")
+
+    deterministic_verdict: FaultLabel = Field(
+        description="Verdict computed by the signature checklist. Authoritative.")
+    verdict_confidence: Literal["high", "medium", "low"] = "low"
+    model_agrees_with_evidence: bool = Field(
+        default=True,
+        description="False when the model's ranking disagrees with the "
+                    "deterministic verdict. The verdict still stands.")
+    disagreement_note: str = ""
+
+    confirming_evidence: list[str] = Field(
+        default_factory=list,
+        description="Checks that passed, quoted with their measured values.")
+    ruled_out: list[str] = Field(
+        default_factory=list,
+        description="Faults eliminated, each with the check that eliminated it.")
+    unconfirmable: list[str] = Field(
+        default_factory=list,
+        description="Faults that could not be confirmed OR eliminated, and why. "
+                    "Never fold these into ruled_out.")
+
+    fourxx_status: Literal["none", "ongoing", "stopped", "unknown"] = "unknown"
+    discriminator_note: str = Field(
+        default="",
+        description="How ladder_collapse was separated from segment_gap, when "
+                    "both were in play. Presence of 404s does not separate "
+                    "them; persistence does.")
+
+    blast_radius: Literal["single_region", "multi_region", "all_regions",
+                          "plant_wide", "none", "unknown"] = "unknown"
+    affected_regions: list[str] = Field(default_factory=list)
+    telemetry_visible: bool = Field(
+        default=True,
+        description="False when no delivery signal moved -- the fault was only "
+                    "findable by looking at pixels.")
+
+    operator_summary: str = Field(
+        description="What an on-call engineer needs to know, in two or three "
+                    "sentences.")
+    recommended_action: str = Field(
+        default="",
+        description="The remediation to propose. Phase 4 gates it on a human.")

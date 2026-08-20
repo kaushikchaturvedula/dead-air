@@ -25,7 +25,7 @@ ALLOY_UI := http://localhost:12345
         set value watch alerts provision tunnel tunnel-url verify \
         player ladder black-source restore-source frame \
         edges edge-port chaos chaos-clear chaos-status \
-        agent agent-watch agent-tools \
+        agent agent-watch agent-sweep agent-tools diagnose-eval diagnose-checks \
         mcp-up mcp-down clean
 
 help: ## Show available targets
@@ -191,6 +191,19 @@ endif
 
 agent-watch: ## Wake the agent on every firing alert from the webhook receiver
 	@$(PY) scripts/run_agent.py --watch 2>&1 \
+	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
+
+agent-sweep: ## Confidence monitor: proactive sweep on a timer (finds black_source)
+	@$(PY) -u scripts/run_agent.py --sweep --interval $(or $(INTERVAL),300) \
+	  --region $(or $(REGION),us-east1) 2>&1 \
+	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
+
+diagnose-checks: ## Fast: score the deterministic checklist on all 6 cases, no model
+	@$(PY) -u scripts/diagnose_eval.py --checks-only 2>&1 \
+	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
+
+diagnose-eval: ## Full: drive all 5 faults + healthy control through the agent
+	@$(PY) -u scripts/diagnose_eval.py 2>&1 \
 	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
 
 agent-tools: ## Show which MCP tools each Phase-1 specialist is pinned to
