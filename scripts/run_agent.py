@@ -58,6 +58,15 @@ APP_NAME = "dead_air"
 # unrecoverable. Prefer a loud failure.
 RUN_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_RUN_TIMEOUT", "900"))
 
+# Demo ceiling. 900s is the right BACKSTOP -- it exists to catch a genuine
+# stall -- but a 15-minute wait on camera is as fatal as an infinite one. Any
+# run that has not finished in five minutes is not going to save the take, so
+# the demo path fails fast and gets retried instead.
+#
+# Measured for calibration: a real alert-path investigation completes in ~165s,
+# so 300s is roughly 2x headroom rather than an arbitrary round number.
+DEMO_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_DEMO_TIMEOUT", "300"))
+
 
 class AgentRunTimeout(RuntimeError):
     """Raised when an investigation exceeds its wall-clock budget."""
@@ -171,7 +180,7 @@ def show(state):
             print(raw)
 
 
-def watch(poll_seconds):
+def watch(poll_seconds, timeout=None):
     print(f"watching {WEBHOOK} for firing alerts (every {poll_seconds}s)",
           flush=True)
     seen = set()
@@ -196,14 +205,19 @@ def watch(poll_seconds):
                           flush=True)
                     continue
                 state = alert_state(payload)
-                final = asyncio.run(run_once(state))
-                show(final)
+                try:
+                    final = asyncio.run(run_once(state, timeout=timeout))
+                    show(final)
+                except Exception as e:
+                    # One failed investigation must not kill the watcher.
+                    print(f"  investigation failed: {type(e).__name__}: {e}",
+                          flush=True)
         except Exception as e:
             print(f"  poll error: {type(e).__name__}: {e}", flush=True)
         time.sleep(poll_seconds)
 
 
-def sweep(interval, region):
+def sweep(interval, region, timeout=None):
     """The confidence monitor: proactive, on a timer, always inspects pixels."""
     print(f"confidence monitor: sweeping {region} every {interval}s "
           f"(vision always runs on this path)", flush=True)
@@ -217,9 +231,11 @@ def sweep(interval, region):
             "trigger_kind": "sweep",
         }
         try:
-            final = asyncio.run(run_once(state))
+            final = asyncio.run(run_once(state, timeout=timeout))
             show(final)
         except Exception as e:
+            # Including AgentRunTimeout: a stalled sweep must not stop the
+            # monitor. Log it and look again on the next tick.
             print(f"  sweep error: {type(e).__name__}: {e}", flush=True)
         time.sleep(interval)
 
@@ -239,14 +255,22 @@ def main():
     ap.add_argument("--timeout", type=float, default=None,
                     help=f"hard ceiling per run in seconds "
                          f"(default {RUN_TIMEOUT_SECONDS:.0f})")
+    ap.add_argument("--demo", action="store_true",
+                    help=f"demo mode: tighter {DEMO_TIMEOUT_SECONDS:.0f}s "
+                         f"ceiling so a stall fails fast enough to retry on "
+                         f"camera")
     args = ap.parse_args()
 
+    budget = args.timeout
+    if budget is None and args.demo:
+        budget = DEMO_TIMEOUT_SECONDS
+
     if args.sweep:
-        sweep(args.interval, args.region or "us-east1")
+        sweep(args.interval, args.region or "us-east1", timeout=budget)
         return
 
     if args.watch:
-        watch(args.poll)
+        watch(args.poll, timeout=budget)
         return
 
     if not args.region:
@@ -260,7 +284,7 @@ def main():
         "alert_status": "firing",
         "trigger_kind": "manual",
     }
-    final = asyncio.run(run_once(state, timeout=args.timeout))
+    final = asyncio.run(run_once(state, timeout=budget))
     show(final)
     if args.json:
         with open(args.json, "w") as fh:
