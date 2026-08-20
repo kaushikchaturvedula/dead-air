@@ -29,8 +29,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_PATH = os.path.join(REPO, "agents", "grafana_probe", ".env")
 
 EMITTER = "http://localhost:9101/metrics"
-ENCODER = "http://localhost:9103/metrics"
-ORIGIN = "http://localhost:8080"
+# ENCODER/ORIGIN are env-overridable so the same checks run against a cloud L1.
+# Cloud step 1 moves exactly these two and nothing else.
+ENCODER = os.environ.get("DEADAIR_ENCODER_URL", "http://localhost:9103") + "/metrics"
+ORIGIN = os.environ.get("DEADAIR_ORIGIN_URL", "http://localhost:8080")
 ALLOY_METRICS = "http://localhost:12345/metrics"
 
 METRIC = "deadair_synthetic_gauge"

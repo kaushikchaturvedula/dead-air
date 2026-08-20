@@ -95,7 +95,7 @@ services:
     container_name: deadair-edge-us-east1
     environment:
       EDGE_REGION: us-east1
-      ORIGIN_URL: http://origin:8080
+      ORIGIN_URL: "${ORIGIN_URL:-http://origin:8080}"
       OTEL_SERVICE_NAME: "deadair-edge-us-east1"
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
       TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
@@ -113,7 +113,7 @@ services:
     container_name: deadair-edge-europe-west1
     environment:
       EDGE_REGION: europe-west1
-      ORIGIN_URL: http://origin:8080
+      ORIGIN_URL: "${ORIGIN_URL:-http://origin:8080}"
       OTEL_SERVICE_NAME: "deadair-edge-europe-west1"
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
       TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
@@ -131,7 +131,7 @@ services:
     container_name: deadair-edge-asia-south1
     environment:
       EDGE_REGION: asia-south1
-      ORIGIN_URL: http://origin:8080
+      ORIGIN_URL: "${ORIGIN_URL:-http://origin:8080}"
       OTEL_SERVICE_NAME: "deadair-edge-asia-south1"
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318"
       TRACE_SAMPLE_RATIO: "${TRACE_SAMPLE_RATIO:-0.02}"
@@ -208,6 +208,11 @@ services:
       - nginx-logs:/var/log/deadair:ro
     env_file:
       - agents/grafana_probe/.env
+    environment:
+      # Where L1 lives. Defaults to the local container; set to <vm-ip>:9103
+      # when the encoder moves to GCE. env_file alone does not forward shell
+      # variables, so this declaration is what makes the override take effect.
+      ENCODER_TARGET: "${ENCODER_TARGET:-encoder:9103}"
     ports:
       # Alloy's own UI -- component graph and remote_write health.
       - "127.0.0.1:12345:12345"

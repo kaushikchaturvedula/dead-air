@@ -37,8 +37,12 @@ prometheus.scrape "plant" {
     },
     // L1: source + encoder. Exports encoder_fps, dropped_frames and
     // packager_segment_lag.
+    //
+    // Address is env-driven so L1 can move to GCE without touching this file:
+    // set ENCODER_TARGET=<vm-ip>:9103. That is the whole of the collector-side
+    // change for cloud step 1.
     {
-      __address__ = "encoder:9103",
+      __address__ = coalesce(sys.env("ENCODER_TARGET"), "encoder:9103"),
       job         = "deadair-plant",
       layer       = "L1",
       component   = "encoder",
