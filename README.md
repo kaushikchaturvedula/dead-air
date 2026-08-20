@@ -2,11 +2,18 @@
 
 **An autonomous broadcast operations agent for live video streaming.**
 
-> ⚠️ **Work in progress.** This repo is an active build for the Google Cloud
-> "Agentic Cinema" hackathon (Grafana track, due 7 Sep 2026). Right now it
-> contains scaffolding and a Grafana Cloud MCP connectivity probe — the
-> streaming plant, chaos injection endpoints, and the DEAD AIR agent itself are
-> not built yet.
+> ⚠️ **Work in progress.** An active build for the Google Cloud "Agentic Cinema"
+> hackathon (Grafana track, due 7 Sep 2026).
+>
+> **Working today, locally:** the full streaming plant (encoder → 3 regional
+> edges → 201-session viewer fleet), all five of the brief's fault modes, all
+> three observability signals (Mimir · Loki · Tempo), and Phases 1–3 of the
+> agent — scope, see, diagnose.
+>
+> **Not built:** Phases 4–5 (human-gated remediation, recovery verification,
+> dashboard annotation) and cloud deployment. Nothing has been deployed and no
+> credits have been spent; see
+> [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md).
 
 ## The thesis: every dashboard is green and the screen is black
 
@@ -270,13 +277,25 @@ round-trip separates the same frames by **10 dB with no overlap**
 choice is settled at `gemini-3.7-flash`, the only tier with a zero false-positive
 rate on healthy frames.
 
-## The agent — Phases 1–2 (working)
+## The agent — Phases 1–3 (working)
 
 ```bash
 make agent REGION=us-east1     # run once
-make agent-watch               # wake on every firing alert
+make agent-watch               # REACTIVE: wake on every firing alert
+make agent-sweep               # PROACTIVE: confidence monitor on a timer
 make agent-tools               # show the pinned MCP subset
+make diagnose-checks           # score all 6 cases, deterministic, no model
 ```
+
+**Two triggers, one pipeline.** Reactive (an alert fires) and proactive (a
+scheduled content sweep) both feed the same phases. The sweep is first-class,
+not a fallback: `black_source` moves no metric, so **no alert can ever fire for
+it** — after ten minutes of black, all three alert instances read `Normal`. An
+alert-driven agent sleeps through the fault this project exists to catch.
+
+A confidence monitor that is always watching is also what real broadcast
+operations run, which makes the thesis self-consistent: the agent finds dead air
+*because it is looking*, not because telemetry told it to.
 
 A `SequentialAgent` phase lifecycle with a `ParallelAgent` fan-out inside Phase
 1 — four specialists querying Mimir, Loki, Tempo and dashboards concurrently
@@ -305,13 +324,25 @@ asked. The rung check is content-independent: it compares the 1080p rung's
 downscale round-trip against the 720p rung's from the same stream, so the ratio
 carries the signal and no `testsrc2` calibration is baked in.
 
-**Known gap: `black_source` fires no alert.** The fault the demo is built around
-moves no metric, so no threshold is crossed and the webhook never fires — after
-10 minutes of black, all three alert instances read `Normal`. That is the
-premise working, not an alerting bug, but it means an alert-driven agent sleeps
-through it. Phase 3 needs a scheduled content sweep: a confidence monitor that
-is always watching, which is what real broadcast operations run. Discussed in
-[docs/agent.md](docs/agent.md#known-gap-black_source-fires-no-alert).
+**Phase 3 — DIAGNOSE.** Gemini ranks which hypotheses are worth testing; **code
+runs the confirming checks and computes the verdict; evidence decides.**
+[`signatures.py`](agents/dead_air/signatures.py) encodes §5's five faults as
+deterministic predicates that reproduce the table measured by
+[`fault_signatures.py`](scripts/fault_signatures.py) — that harness stays the
+ground truth. Verified **6/6** on the live plant: all five faults plus a healthy
+control.
+
+The `ladder_collapse` vs `segment_gap` discriminator is computed, not reasoned
+about. Both produce 404s, so presence separates nothing — persistence does:
+
+| `fourxx_status` | Meaning | Fault |
+| --- | --- | --- |
+| `ongoing` | segments still being deleted | `segment_gap` |
+| `stopped` | burst died out as players re-read the manifest | `ladder_collapse` |
+
+And missing evidence is never elimination: a fault whose required checks cannot
+be evaluated is **`unconfirmable`**, kept in a separate field from `ruled_out`.
+Conflating the two is how an agent reports false certainty.
 
 **Step 5 — cloud deployment (not started).** GCE origin, then three Cloud Run
 edges. Nothing is blocked on it — all four layers run locally today.
