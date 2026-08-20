@@ -247,6 +247,29 @@ trace. A captured trace reads *viewer 7.8ms → edge 5.9ms (cache MISS) → orig
 3.5ms* — causality neither metrics nor logs can express, and what the agent's
 Phase 1 fans out across.
 
+**Vision spike — the premise holds, with one correction.** Before building the
+agent, the riskiest assumption was tested directly: can Gemini actually see
+these faults? Full results in [docs/vision-spike.md](docs/vision-spike.md).
+
+| Fault | Vision | Who decides |
+| --- | --- | --- |
+| `black_source` | **100%, every model and variant** | vision |
+| `ladder_mismatch` | **no model separates it from healthy** | code decides, vision confirms |
+
+`black_source` — the fault the whole demo is built around — is detected
+perfectly and never confused with a healthy frame. `ladder_mismatch` is not:
+the flash tiers call everything crisp, `gemini-2.5-pro` calls everything
+upscaled (flagging **9/9 healthy frames** as faulty), and cross-rung pairing
+makes it *worse* because the models confabulate the comparison in fluent,
+confident, exactly-backwards prose.
+
+That fault is trivially measurable in code, though — a downscale/upscale
+round-trip separates the same frames by **10 dB with no overlap**
+([`scripts/rung_resolution_check.py`](scripts/rung_resolution_check.py)). So for
+`ladder_mismatch` the architecture inverts: code decides, vision narrates. Model
+choice is settled at `gemini-3.7-flash`, the only tier with a zero false-positive
+rate on healthy frames.
+
 **Step 5 — cloud deployment (not started).** GCE origin, then three Cloud Run
 edges. Nothing is blocked on it — all four layers run locally today.
 

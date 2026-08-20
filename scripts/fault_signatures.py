@@ -20,6 +20,7 @@ of batching lag to every measurement without changing what is observed.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -30,6 +31,8 @@ ENCODER = "http://localhost:9103"
 VIEWERS = "http://localhost:9104"
 ORIGIN = "http://localhost:8080"
 EDGE_PORTS = {"us-east1": 8081, "europe-west1": 8082, "asia-south1": 8083}
+
+FIXTURES = False
 
 # mode -> (settle seconds, region or None, severity)
 MODES = {
@@ -140,24 +143,67 @@ def clear_and_settle(seconds=75):
     time.sleep(seconds)
 
 
-def capture_frame(mode):
-    """Grab a frame from the top rung -- the only evidence for the two faults
-    that are invisible in telemetry."""
+RUNGS = ["1080p", "720p", "480p", "360p"]
+FIXTURE_ROOT = "fixtures/frames"
+
+
+def grab_frame(rung, out_path, nth_from_end=1):
+    """Pull a segment for `rung` and decode one frame to out_path."""
     try:
-        pl = get(f"{ORIGIN}/hls/1080p/index.m3u8")
-        seg = [l.strip() for l in pl.splitlines() if l.strip().endswith(".ts")]
-        if not seg:
-            return None
-        url = f"{ORIGIN}/hls/1080p/{seg[-1]}"
-        subprocess.run(["curl", "-sS", "-o", "/tmp/fs.ts", url], check=True,
-                       capture_output=True, timeout=60)
-        out = f"frames/signature-{mode}.png"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", "/tmp/fs.ts",
-                        "-frames:v", "1", out], check=True, capture_output=True,
-                       timeout=60)
-        return out
+        pl = get(f"{ORIGIN}/hls/{rung}/index.m3u8")
     except Exception:
         return None
+    segs = [l.strip() for l in pl.splitlines() if l.strip().endswith(".ts")]
+    if len(segs) < nth_from_end:
+        return None
+    seg = segs[-nth_from_end]
+    tmp = f"/tmp/fixture-{rung}.ts"
+    try:
+        subprocess.run(["curl", "-sS", "-o", tmp, f"{ORIGIN}/hls/{rung}/{seg}"],
+                       check=True, capture_output=True, timeout=90)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        # Seek mid-segment so we do not always sample the opening IDR, which is
+        # atypically clean and would flatter the encoder.
+        #
+        # NOTE: -ss must come AFTER -i. As an input option it seeks by absolute
+        # timestamp, and HLS segments carry a non-zero start PTS, so `-ss 1 -i`
+        # lands past the end and silently writes a zero-frame file -- an empty
+        # eval set that looks like a capture that "just found nothing".
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", tmp,
+                        "-ss", "1", "-frames:v", "1", out_path],
+                       check=True, capture_output=True, timeout=90)
+        return out_path if os.path.exists(out_path) else None
+    except Exception:
+        return None
+
+
+def capture_frame(mode):
+    """Single top-rung frame, kept for the signature report."""
+    return grab_frame("1080p", f"frames/signature-{mode}.png")
+
+
+def capture_fixtures(mode, per_rung=3):
+    """Capture the vision eval set: several frames from every rung.
+
+    This is the SEE-phase eval set, not a screenshot. It is regenerated from the
+    live plant so it can never drift from what the encoder actually produces,
+    and it records rung ABSENCE too -- for ladder_collapse the evidence is that
+    the 1080p rung has no frames at all, which is itself a fixture.
+    """
+    captured = {}
+    for rung in RUNGS:
+        got = []
+        for i in range(per_rung):
+            out = os.path.join(FIXTURE_ROOT, mode, f"{rung}_{i}.png")
+            # Space samples across the live window so they are not near-duplicates.
+            if grab_frame(rung, out, nth_from_end=1 + i):
+                got.append(out)
+                if i < per_rung - 1:
+                    time.sleep(4)
+        captured[rung] = got
+        print(f"    {mode}/{rung}: {len(got)} frame(s)"
+              + ("  <-- RUNG ABSENT" if not got else ""), flush=True)
+    return captured
 
 
 def describe(mode, before, after, deltas_4xx, deltas_5xx):
@@ -226,6 +272,10 @@ def run_mode(mode):
     d4 = status_rate(before, after, "4xx")
     d5 = status_rate(before, after, "5xx")
     frame = capture_frame(mode)
+    fixtures = None
+    if FIXTURES:
+        print("  capturing vision fixtures:", flush=True)
+        fixtures = capture_fixtures(mode)
 
     print("  SIGNATURE:", flush=True)
     for line in describe(mode, before, after, d4, d5):
@@ -234,14 +284,19 @@ def run_mode(mode):
         print(f"    - frame captured: {frame}", flush=True)
 
     return {"mode": mode, "before": before, "after": after,
-            "d4xx": d4, "d5xx": d5, "frame": frame}
+            "d4xx": d4, "d5xx": d5, "frame": frame, "fixtures": fixtures}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("modes", nargs="*", default=[])
     ap.add_argument("--json", help="write raw observations here")
+    ap.add_argument("--fixtures", action="store_true",
+                    help="also capture the vision eval frame set under fixtures/")
     args = ap.parse_args()
+
+    global FIXTURES
+    FIXTURES = args.fixtures
 
     modes = args.modes or list(MODES)
     unknown = [m for m in modes if m not in MODES]
@@ -250,6 +305,10 @@ def main():
 
     results = []
     try:
+        if FIXTURES:
+            print("\ncapturing HEALTHY fixtures (the control set)", flush=True)
+            clear_and_settle(75)
+            capture_fixtures("healthy")
         for mode in modes:
             results.append(run_mode(mode))
     finally:
