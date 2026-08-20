@@ -25,6 +25,7 @@ ALLOY_UI := http://localhost:12345
         set value watch alerts provision tunnel tunnel-url verify \
         player ladder black-source restore-source frame \
         edges edge-port chaos chaos-clear chaos-status \
+        agent agent-watch agent-tools \
         mcp-up mcp-down clean
 
 help: ## Show available targets
@@ -178,6 +179,23 @@ chaos-status: ## Show every injected fault across L1 and L2
 	  printf "L2 %-13s " "$$r"; \
 	  curl -sS "http://localhost:$$port/chaos" 2>/dev/null || echo "unreachable"; \
 	done
+
+# --- the agent --------------------------------------------------------------
+
+agent: ## Run the DEAD AIR agent once, e.g. make agent REGION=us-east1
+ifndef REGION
+	$(error usage: make agent REGION=<$(REGIONS)>)
+endif
+	@$(PY) scripts/run_agent.py --region $(REGION) 2>&1 \
+	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
+
+agent-watch: ## Wake the agent on every firing alert from the webhook receiver
+	@$(PY) scripts/run_agent.py --watch 2>&1 \
+	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
+
+agent-tools: ## Show which MCP tools each Phase-1 specialist is pinned to
+	@$(PY) scripts/show_agent_tools.py 2>&1 \
+	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
 
 # --- Grafana Cloud ----------------------------------------------------------
 

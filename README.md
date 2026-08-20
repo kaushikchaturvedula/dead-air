@@ -270,6 +270,49 @@ round-trip separates the same frames by **10 dB with no overlap**
 choice is settled at `gemini-3.7-flash`, the only tier with a zero false-positive
 rate on healthy frames.
 
+## The agent — Phases 1–2 (working)
+
+```bash
+make agent REGION=us-east1     # run once
+make agent-watch               # wake on every firing alert
+make agent-tools               # show the pinned MCP subset
+```
+
+A `SequentialAgent` phase lifecycle with a `ParallelAgent` fan-out inside Phase
+1 — four specialists querying Mimir, Loki, Tempo and dashboards concurrently
+through the self-hosted MCP server, then a synthesiser emitting a
+schema-validated `IncidentScope`. Phase 2 fetches the real segment from the
+affected edge and emits a `VisualFinding`. Details in [docs/agent.md](docs/agent.md).
+
+**The agent sees 12 of the 73 MCP tools**, no specialist more than 4. 73 tool
+declarations degrades function-calling accuracy, and pinning makes the search
+space a reviewable design decision rather than whatever the MCP server happens
+to expose that week.
+
+**Verified on three different faults:**
+
+| Injected | Phase 1 narrowed to | Phase 2 found | Correct |
+| --- | --- | --- | --- |
+| `black_source` | `black_source`, `ladder_mismatch` | `black_frame`, timecode **advancing** | ✅ |
+| `edge_latency` | `edge_latency` (single region) | pixels healthy, no content fault | ✅ |
+| `ladder_mismatch` | — | vision said **healthy**; code measured ratio **1.199** → `ladder_mismatch` | ✅ |
+
+That last row is the spike's finding paying off. Vision looked straight at the
+upscaled frame and called it healthy at confidence 1.0 — and the agent still
+got the right answer, because resolution is decided by
+[`check_rung_resolution`](scripts/rung_resolution_check.py) and vision is never
+asked. The rung check is content-independent: it compares the 1080p rung's
+downscale round-trip against the 720p rung's from the same stream, so the ratio
+carries the signal and no `testsrc2` calibration is baked in.
+
+**Known gap: `black_source` fires no alert.** The fault the demo is built around
+moves no metric, so no threshold is crossed and the webhook never fires — after
+10 minutes of black, all three alert instances read `Normal`. That is the
+premise working, not an alerting bug, but it means an alert-driven agent sleeps
+through it. Phase 3 needs a scheduled content sweep: a confidence monitor that
+is always watching, which is what real broadcast operations run. Discussed in
+[docs/agent.md](docs/agent.md#known-gap-black_source-fires-no-alert).
+
 **Step 5 — cloud deployment (not started).** GCE origin, then three Cloud Run
 edges. Nothing is blocked on it — all four layers run locally today.
 
