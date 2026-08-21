@@ -140,7 +140,12 @@ def profile(spans):
 
     # ---- Are the specialists actually parallel? -------------------------
     print("PHASE 1 SPECIALISTS -- parallel or serialised?")
-    print(f"  {'specialist':<20}{'start':>8}{'end':>8}{'busy':>8}"
+    # "window", not "busy": this is the span envelope. A specialist is frozen
+    # after every event it emits until a single serial consumer acknowledges
+    # (parallel_agent.py:63-71 and 86-96, invocation_context.py:305-311,
+    # runners.py:849-888), so the envelope includes handshake blocking that the
+    # agent did not spend doing work.
+    print(f"  {'specialist':<20}{'start':>8}{'end':>8}{'window':>8}"
           f"{'llm':>7}{'tool':>7}{'calls':>7}")
     print("  " + "-" * 65)
 

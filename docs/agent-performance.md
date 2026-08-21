@@ -32,17 +32,47 @@ There is no latency problem to fix in the Grafana layer. (A 60.3s
 `verify_recovery` span in Phase 5 is a *local* polling tool that deliberately
 waits for the plant to settle, not an MCP call.)
 
-The four specialists do overlap: 238.4s of specialist work inside 117.6s of wall
-clock, 2.03x — and 404.4s inside 178.3s, 2.27x, on the second run.
+**That 5% is an undercount, and here is by how much.** It counts only
+`execute_tool` spans. ADK re-resolves every toolset on *each model step*
+(`base_llm_flow.py:494-498`, "the cache is refreshed each time"), and for an
+`McpToolset` that means a live `list_tools` round trip
+(`mcp_toolset.py:365-383`). None of it is instrumented: ADK wraps only
+`execute_tool`, and `opentelemetry-instrumentation-httpx` is not installed, so
+the HTTP call is invisible. Measured directly, `get_tools()` costs **~19ms
+median** after a **1.4s** first-call session setup. Across ~63 model steps and
+4 specialist sessions that is roughly **1-6s of hidden MCP traffic** on a 362s
+run — so the real figure is nearer 7% than 5%, and the conclusion is unchanged.
+It is recorded here because an unmeasured term should be named and sized, not
+left out.
 
-**A caveat on how NOT to measure this.** All four specialists stamp a start time
-of 0.0s, which looks like proof of concurrency and is not. `ParallelAgent`
-creates all sub-agent tasks with no await between them
-(`parallel_agent.py:82-84`), and `BaseAgent.run_async` opens its
-`invoke_agent <name>` span before any awaitable work (`base_agent.py:297-298`),
-so four spans would stamp identical starts even if the loop then ran them
-strictly one after another. The profiler reports start spread as context and
-rests its verdict on overlap, which is real evidence.
+### How NOT to measure this — two traps I fell into
+
+**Start spread proves nothing.** All four specialists stamp a start of 0.0s,
+which looks like proof of concurrency. `ParallelAgent` creates all sub-agent
+tasks with no await between them (`parallel_agent.py:82-84`), and
+`BaseAgent.run_async` opens its `invoke_agent <name>` span before any awaitable
+work (`base_agent.py:297-298`), so four spans stamp identical starts even under
+strict serialisation. The profiler now rests its verdict on overlap and reports
+start spread as context only.
+
+**The specialists are not freely concurrent, and `busy` is not busy time.** They
+are real asyncio tasks, but every event one emits blocks it until a *single
+serial consumer* acknowledges: `process_an_agent` awaits `resume_signal.wait()`
+after each `queue.put` (`parallel_agent.py:63-71`), the merge loop is sequential
+(`parallel_agent.py:86-96`), non-partial events additionally block on session
+append (`invocation_context.py:305-311`), and `_consume_event_queue`
+(`runners.py:849-888`) is one loop for the whole invocation. So the `busy`
+column is a span *envelope* that includes time frozen on those handshakes.
+
+The 2.03x and 2.27x overlap ratios are still real evidence that work was in
+flight simultaneously, and the conclusion — the fan-out is not what makes this
+slow — survives. But "the specialists run freely in parallel" would be wrong:
+they contend on one consumer, and that is a second reason a straggler hurts.
+
+Correspondingly, **"model time 99.2%" is a union across four concurrent agents**
+and saturates trivially — one agent's uninstrumented scaffolding hides beneath a
+sibling's `call_llm` span. Read it as "the run is model-bound", not as "only
+0.8% of each agent's time is non-model work".
 
 ## Finding 2 — scope is not 52%, and Phase 5 is just as expensive
 
