@@ -48,7 +48,10 @@ ORIGIN = os.environ.get("ORIGIN_URL", "http://origin:8080").rstrip("/")
 
 # Segments are immutable once written; manifests are live and must never be
 # cached or players get stuck on a stale segment list.
-SEGMENT_TTL = float(os.environ.get("SEGMENT_CACHE_TTL", "60"))
+# Segments leave the live playlist after ~24s (6 x 4s), so nothing needs them
+# much beyond that. A 60s TTL held roughly 2.5x the useful working set, which
+# pushed the byte cap into evicting entries that were still hot.
+SEGMENT_TTL = float(os.environ.get("SEGMENT_CACHE_TTL", "30"))
 # Live manifests get a SHORT cache, not none.
 #
 # Measured against a GCE origin: 87.8% of all origin requests were manifests,
@@ -94,6 +97,11 @@ LATENCY_BY_SEVERITY = {
 
 TTFB_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
 
+# How long a coalesced waiter will wait for the leader's fetch before giving up
+# and fetching itself. Must exceed a slow WAN segment fetch but stay under the
+# viewer's own timeout.
+ORIGIN_WAIT_TIMEOUT = float(os.environ.get("ORIGIN_WAIT_TIMEOUT", "20"))
+
 _lock = threading.Lock()
 _cache = OrderedDict()          # path -> (expiry, status, body, content_type)
 _cache_bytes = 0
@@ -102,6 +110,26 @@ _seq = 0                        # request counter, drives segment_gap
 
 _hits = 0
 _misses = 0
+# Cache forensics. The 62% hit ratio measured against the GCE origin is worth
+# ~5.7x the egress a working cache would produce, so instrument the two
+# plausible causes rather than guessing between them:
+#   evictions  -> the byte cap is throwing out segments still being read
+#   stampede   -> N viewers miss the SAME segment concurrently because the
+#                 first fetch has not returned yet, so one segment is pulled
+#                 from origin many times over
+_evictions = 0
+_evicted_bytes = 0
+_stampede = 0            # misses that arrived while an identical fetch was open
+_inflight = {}           # path -> number of fetches currently open for it
+_distinct_fetched = set()  # paths fetched from origin at least once
+_origin_fetches = 0      # total origin fetches, including duplicates
+_coalesced = 0           # misses served by waiting on an in-flight fetch
+_reaped = 0              # expired entries removed before size-based eviction
+# Single-flight: one origin fetch per object, no matter how many viewers ask
+# for it simultaneously. Measured cause of the egress overage -- 67 viewers per
+# edge all want the newest segment at once, and without this every one of them
+# pulled it from origin independently.
+_pending = {}            # path -> Event signalling the in-flight fetch is done
 _status_counts = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
 _shield_misses = 0
 _ttfb_buckets = [0] * (len(TTFB_BUCKETS) + 1)
@@ -141,9 +169,14 @@ def render_metrics():
         buckets = list(_ttfb_buckets)
         tsum, tcount = _ttfb_sum, _ttfb_count
         chaos = dict(_chaos)
+        evictions, cbytes, centries = _evictions, _cache_bytes, len(_cache)
+        ofetch, distinct, stampede = _origin_fetches, len(_distinct_fetched), _stampede
+        coalesced, reaped = _coalesced, _reaped
 
     total = hits + misses
-    ratio = (hits / total) if total else 0.0
+    # A coalesced request never touched origin, so it counts as a hit for the
+    # purpose of "did this cost us egress" -- which is what the ratio is for.
+    ratio = ((hits + coalesced) / total) if total else 0.0
     r = f'region="{REGION}"'
 
     out = [
@@ -184,6 +217,33 @@ def render_metrics():
         "# HELP edge_chaos_active 1 when a fault is injected at this edge.\n",
         "# TYPE edge_chaos_active gauge\n",
         f"edge_chaos_active{{{r}}} {0 if chaos['mode'] == 'none' else 1}\n",
+        "# HELP edge_cache_evictions_total Entries evicted by the byte cap.\n",
+        "# TYPE edge_cache_evictions_total counter\n",
+        f"edge_cache_evictions_total{{{r}}} {evictions}\n",
+        "# HELP edge_cache_bytes Current cache size in bytes.\n",
+        "# TYPE edge_cache_bytes gauge\n",
+        f"edge_cache_bytes{{{r}}} {cbytes}\n",
+        "# HELP edge_cache_entries Current cached object count.\n",
+        "# TYPE edge_cache_entries gauge\n",
+        f"edge_cache_entries{{{r}}} {centries}\n",
+        "# HELP edge_origin_fetches_total Origin fetches including duplicates.\n",
+        "# TYPE edge_origin_fetches_total counter\n",
+        f"edge_origin_fetches_total{{{r}}} {ofetch}\n",
+        "# HELP edge_origin_distinct_objects Distinct objects ever fetched.\n",
+        "# TYPE edge_origin_distinct_objects gauge\n",
+        f"edge_origin_distinct_objects{{{r}}} {distinct}\n",
+        "# HELP edge_cache_stampede_total Misses that arrived while an "
+        "identical origin fetch was already open.\n",
+        "# TYPE edge_cache_stampede_total counter\n",
+        f"edge_cache_stampede_total{{{r}}} {stampede}\n",
+        "# HELP edge_cache_coalesced_total Misses served by waiting on an "
+        "in-flight fetch instead of issuing a duplicate origin request.\n",
+        "# TYPE edge_cache_coalesced_total counter\n",
+        f"edge_cache_coalesced_total{{{r}}} {coalesced}\n",
+        "# HELP edge_cache_reaped_total Expired entries removed proactively, "
+        "so the size cap never evicts a live segment.\n",
+        "# TYPE edge_cache_reaped_total counter\n",
+        f"edge_cache_reaped_total{{{r}}} {reaped}\n",
         "# HELP edge_up Always 1; presence proves the edge is scrapeable.\n",
         "# TYPE edge_up gauge\n",
         f"edge_up{{{r}}} 1\n",
@@ -241,7 +301,15 @@ def should_drop(path):
 
 def fetch_origin(path, traceparent=None):
     """Fetch from origin. Returns (status, body, content_type)."""
-    global _shield_misses
+    global _shield_misses, _stampede, _origin_fetches
+    with _lock:
+        _origin_fetches += 1
+        _distinct_fetched.add(path)
+        if _inflight.get(path):
+            # Someone else is already fetching this exact object. Every such
+            # request is a redundant origin pull -- the stampede signature.
+            _stampede += 1
+        _inflight[path] = _inflight.get(path, 0) + 1
     url = f"{ORIGIN}{path}"
     req = urllib.request.Request(url)
     if traceparent:
@@ -261,6 +329,13 @@ def fetch_origin(path, traceparent=None):
         return e.code, e.read(), "text/plain"
     except Exception:
         return 502, b"origin unreachable\n", "text/plain"
+    finally:
+        with _lock:
+            n = _inflight.get(path, 1) - 1
+            if n <= 0:
+                _inflight.pop(path, None)
+            else:
+                _inflight[path] = n
 
 
 def cache_get(path):
@@ -286,20 +361,99 @@ def _ttl_for(path):
     return 0.0
 
 
+def _reap_expired_locked():
+    """Drop entries whose TTL has passed. Caller must hold _lock.
+
+    Expiry was previously lazy -- an entry only disappeared when someone asked
+    for it again. Nothing asks for a segment that has left the live playlist, so
+    dead entries accumulated and consumed the byte budget, and the size cap then
+    evicted entries that were still hot. Those hot objects were promptly
+    re-fetched from origin, which is why 70-77% of origin fetches were repeats
+    of an object we had recently held. Reaping the dead first means the cap only
+    ever sees the live working set.
+    """
+    global _cache_bytes
+    now = time.time()
+    dead = [p for p, (expiry, *_r) in _cache.items() if now > expiry]
+    for p in dead:
+        entry = _cache.pop(p, None)
+        if entry:
+            _cache_bytes -= len(entry[2])
+    return len(dead)
+
+
 def cache_put(path, status, body, ctype):
     ttl = _ttl_for(path)
     if ttl <= 0 or status != 200:
         return
-    global _cache_bytes
+    global _cache_bytes, _reaped
     with _lock:
+        _reaped += _reap_expired_locked()
         prev = _cache.pop(path, None)
         if prev:
             _cache_bytes -= len(prev[2])
         _cache[path] = (time.time() + ttl, status, body, ctype)
         _cache_bytes += len(body)
+        global _evictions, _evicted_bytes
         while _cache_bytes > MAX_CACHE_BYTES and _cache:
             _, evicted = _cache.popitem(last=False)
             _cache_bytes -= len(evicted[2])
+            _evictions += 1
+            _evicted_bytes += len(evicted[2])
+
+
+def fetch_single_flight(path, parent_span):
+    """Fetch `path` from origin, collapsing concurrent requests into one.
+
+    The first caller for a given object becomes the leader and performs the
+    fetch; everyone else waits for it and is then served from cache. Without
+    this, a new segment appearing triggers one origin pull PER VIEWER -- 74-80%
+    of measured origin fetches were exact duplicates, and over a WAN, where a
+    fetch stays open for ~1s, that is the entire egress overage.
+    """
+    global _coalesced
+    with _lock:
+        event = _pending.get(path)
+        leader = event is None
+        if leader:
+            event = threading.Event()
+            _pending[path] = event
+
+    if not leader:
+        # Someone is already fetching this. Wait for them rather than adding
+        # another identical request to the origin.
+        if event.wait(timeout=ORIGIN_WAIT_TIMEOUT):
+            cached = cache_get(path)
+            if cached:
+                with _lock:
+                    _coalesced += 1
+                status, body, ctype = cached
+                return status, body, ctype, "COALESCED"
+        # Leader failed or timed out -- fall through and fetch it ourselves
+        # rather than failing the viewer.
+
+    origin_span = tracing.Span(
+        "origin.fetch_segment",
+        trace_id=parent_span.trace_id, parent_id=parent_span.span_id,
+        kind="client", sampled=parent_span.sampled,
+        attributes={"deadair.layer": "L1", "http.route": path,
+                    "deadair.single_flight_leader": leader},
+    )
+    try:
+        with origin_span:
+            status, body, ctype = fetch_origin(
+                path, traceparent=origin_span.traceparent())
+            origin_span.set("http.status_code", status)
+            origin_span.set("http.response_size", len(body))
+            if status >= 400:
+                origin_span.error(f"origin returned {status}")
+        cache_put(path, status, body, ctype)
+        return status, body, ctype, "MISS"
+    finally:
+        if leader:
+            with _lock:
+                _pending.pop(path, None)
+            event.set()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -382,23 +536,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 with _lock:
                     _misses += 1
-                # A child span for the origin call: this is what tells the agent
-                # whether a slow edge is slow itself or just waiting on origin.
-                origin_span = tracing.Span(
-                    "origin.fetch_segment",
-                    trace_id=span.trace_id, parent_id=span.span_id,
-                    kind="client", sampled=span.sampled,
-                    attributes={"deadair.layer": "L1", "http.route": path},
-                )
-                with origin_span:
-                    status, body, ctype = fetch_origin(
-                        path, traceparent=origin_span.traceparent())
-                    origin_span.set("http.status_code", status)
-                    origin_span.set("http.response_size", len(body))
-                    if status >= 400:
-                        origin_span.error(f"origin returned {status}")
-                cache_put(path, status, body, ctype)
-                cache_state = "MISS"
+                status, body, ctype, cache_state = fetch_single_flight(
+                    path, span)
 
             record_status(status)
             # TTFB is recorded before throughput shaping so the metric keeps its

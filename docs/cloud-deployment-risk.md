@@ -74,9 +74,45 @@ Two things follow:
   edges are on Cloud Run, origin→edge becomes GCP-internal: free in-region,
   ~$0.02/GB cross-region. The same traffic gets 6–12× cheaper simply by moving
   the edges, which is step 2.
-- **Cache hit ratio is the lever, and 62% is low.** Sixty-seven viewers per edge
-  all watching the live edge should request nearly the same segments. Raising
-  that ratio attacks the cost directly, and is worth doing before step 2.
+- **Cache hit ratio is the lever, and 62% was low.** FIXED -- see below.
+
+### Cache fix, measured locally 2026-08-21
+
+Two independent bugs, both real, neither the whole story on its own:
+
+1. **Cache stampede.** 67 viewers per edge want the newest segment at the same
+   moment. Every one of them missed and pulled it from origin independently,
+   because the first fetch had not returned yet. Locally a fetch completes in
+   ~5ms so few requests collided; over a WAN each fetch stays open ~1s, making
+   the collision window ~200x wider. Origin latency was the amplifier, not the
+   cause. Fixed with **single-flight coalescing**: the first caller fetches,
+   everyone else waits for it and is served from cache.
+2. **Expiry was lazy, so the size cap evicted live segments.** An entry only
+   disappeared when someone asked for it again -- and nothing asks for a segment
+   that has left the live playlist. Dead entries accumulated to the 192MB cap,
+   which then evicted objects that were still hot, and those were immediately
+   re-fetched. Fixed by **reaping expired entries before size-based eviction**,
+   and by cutting segment TTL from 60s to 30s (the live window is ~24s).
+
+| | Before | After |
+| --- | --- | --- |
+| Cache hit ratio | 62% | **95.5 - 97.2%** |
+| Evictions | 85 - 150 per 6 min | **0** |
+| Cache size | pinned at the 200MB cap | 18 - 33MB (the true working set) |
+| Fetches per segment | — | **2.42** (3.00 = one per edge = perfect) |
+| Origin egress | 80.4 GB/hour | **11.5 GB/hour** |
+
+11.5 GB/hour is *below* the 13.9 GB/hour theoretical floor because not every
+edge pulls every rung. Projected cloud cost falls from **$9.65/hour to roughly
+$1.40/hour**, and coalescing specifically neutralises the latency amplifier, so
+the improvement should survive the WAN -- but that is a projection from a local
+measurement and needs re-checking on the VM before step 2 is trusted.
+
+A measurement caveat worth recording: the first "duplicate fetch" metric said
+72% even after both fixes, which looked like failure. It was counting requests,
+and 73.5% of origin requests are manifest refreshes that carry **0.0% of the
+bytes**. A live playlist *must* be re-fetched; it changes. Bytes are 100%
+segments, and segments are what egress bills for.
 
 **The plant must never be left running in the cloud unattended.** `stop` is not
 housekeeping here, it is the difference between a $2 experiment and a dead
