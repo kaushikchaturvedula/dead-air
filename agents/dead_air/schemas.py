@@ -231,12 +231,15 @@ class RemediationProposal(BaseModel):
                     "that Phase 5 can then verify.")
     slo_to_verify: Literal["rebuffer_ratio", "visual_frame_check",
                            "both"] = Field(
-        default="rebuffer_ratio",
+        default="both",
         description="How Phase 5 confirms recovery. CONTENT faults "
                     "(black_source, ladder_mismatch) MUST use "
                     "visual_frame_check: rebuffer_ratio never moved for them, "
                     "so it would report recovery on a still-black stream. "
-                    "Delivery faults use rebuffer_ratio.")
+                    "Delivery faults use rebuffer_ratio. The default is BOTH: "
+                    "if the model omits this field, over-verifying costs a few "
+                    "seconds, while defaulting to rebuffer_ratio would fall "
+                    "back to the one metric that is blind to content faults.")
 
     blast_radius: str = Field(
         description="What else this touches. An encoder restart interrupts "

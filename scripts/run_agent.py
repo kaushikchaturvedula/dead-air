@@ -45,6 +45,7 @@ from google.adk.sessions import InMemorySessionService           # noqa: E402
 from google.genai import types                                   # noqa: E402
 
 from dead_air.agent import root_agent                            # noqa: E402
+from dead_air.observability import reset_usage, usage_totals     # noqa: E402
 
 WEBHOOK = os.environ.get("DEADAIR_WEBHOOK", "http://localhost:9102")
 APP_NAME = "dead_air"
@@ -111,6 +112,7 @@ async def run_once(state, quiet=False, timeout=None):
 
 
 async def _run_once_inner(state, quiet, started):
+    reset_usage()
     session_service = InMemorySessionService()
     runner = Runner(agent=root_agent, app_name=APP_NAME,
                     session_service=session_service)
@@ -158,9 +160,14 @@ async def _run_once_inner(state, quiet, started):
     final = await session_service.get_session(
         app_name=APP_NAME, user_id="alertmanager", session_id=session.id)
     elapsed = time.monotonic() - started
-    print(f"  [done] investigation completed in {elapsed:.1f}s", flush=True)
+    usage = usage_totals()
+    print(f"  [done] investigation completed in {elapsed:.1f}s  "
+          f"llm_calls={usage['llm_calls']} tools={usage['tool_calls']} "
+          f"tokens={usage['input_tokens']}in/{usage['output_tokens']}out "
+          f"est_cost=${usage['usd']}", flush=True)
     st = dict(final.state)
     st["_elapsed_seconds"] = round(elapsed, 1)
+    st["_usage"] = usage
     return st
 
 

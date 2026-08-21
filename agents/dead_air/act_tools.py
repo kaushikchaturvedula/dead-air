@@ -76,6 +76,14 @@ ACTIONS = {
     },
 }
 
+# Fault CLASS, not fault action. Content faults move no delivery metric at all,
+# so viewer impact for them cannot be derived from rebuffer_ratio -- it is 0.0
+# throughout while every viewer sees nothing. This table is the single source of
+# that distinction, and it is consulted by CODE so a model cannot reason its way
+# to the wrong answer.
+CONTENT_FAULTS = {"black_source", "ladder_mismatch"}
+DELIVERY_FAULTS = {"edge_latency", "segment_gap", "ladder_collapse"}
+
 FAULT_TO_ACTION = {
     "black_source": "restart_encoder_with_healthy_source",
     "ladder_collapse": "restore_missing_rendition",
@@ -389,45 +397,92 @@ def record_incident(title: str, summary: str, severity: str = "minor",
     }
 
 
-def estimate_viewer_impact(impact_ratio: float, affected_regions: int,
-                           duration_seconds: float) -> dict:
-    """Estimate viewer-minutes lost. An ESTIMATE, with its assumptions stated.
+def _affected_regions_from_state(tool_context):
+    """Read the affected region list Phase 1/3 already established."""
+    if tool_context is None:
+        return []
+    for key in ("diagnosis", "incident_scope"):
+        raw = tool_context.state.get(key)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(raw, dict):
+            regions = raw.get("affected_regions")
+            if regions:
+                return [r for r in regions if isinstance(r, str)]
+    return []
 
-    CHOOSING impact_ratio IS THE WHOLE JUDGEMENT, and getting it wrong produces
-    the most misleading number this system can emit:
 
-      delivery faults (edge_latency, segment_gap, ladder_collapse)
-          use the peak rebuffer_ratio -- viewers lost that FRACTION of their
-          viewing time.
+def _peak_rebuffer(regions):
+    """Measure the peak rebuffer_ratio over the incident window, in code."""
+    from .diagnose_tools import _clean, _promql
+    scope = "|".join(regions) if regions else ".+"
+    q = f'max(max_over_time(rebuffer_ratio{{region=~"{scope}"}}[20m]))'
+    vals = _clean(_promql(q))
+    return max(vals.values()) if vals else 0.0
+
+
+def estimate_viewer_impact(fault_id: str, duration_seconds: float,
+                           tool_context=None) -> dict:
+    """Estimate viewer-minutes lost. Arithmetic is done in CODE.
+
+    The model supplies only the fault. Everything else -- which regions were
+    affected, and what fraction of viewing was lost -- is derived here, because
+    the impact ratio is exactly the judgement a model gets backwards:
 
       content faults (black_source, ladder_mismatch)
-          use 1.0. rebuffer_ratio was 0.0 throughout, because nothing stalled --
-          the bytes arrived perfectly and carried the wrong picture. Passing
-          that 0.0 here reports "0.0 viewer-minutes lost" for a total blackout,
-          which is precisely backwards: EVERY viewer lost the picture for the
-          ENTIRE incident.
+          ratio 1.0. rebuffer_ratio reads 0.0 throughout, because nothing
+          stalled: the bytes arrived perfectly and carried the wrong picture. A
+          model reasoning "rebuffer was 0.0, so impact is 0.0" reports zero
+          viewer-minutes lost for a total blackout. That is not a prompt
+          problem, it is a correct-looking inference from a blind metric, so
+          the answer is taken out of the model's hands.
+
+      delivery faults
+          ratio is the MEASURED peak rebuffer_ratio over the incident window,
+          queried here rather than recalled.
 
     Args:
-        impact_ratio: fraction of viewing time lost, 0.0-1.0. See above.
-        affected_regions: how many regions were degraded.
+        fault_id: the diagnosed fault. The only input the model provides.
         duration_seconds: detection to recovery.
 
     Returns:
         dict with the estimate and the assumptions behind it.
     """
-    rebuffer_ratio = impact_ratio
+    regions = _affected_regions_from_state(tool_context)
+    if fault_id in CONTENT_FAULTS:
+        impact_ratio = 1.0
+        basis = ("content fault: every viewer lost the picture for the whole "
+                 "incident, and no delivery metric moved")
+        # A content fault affects every region -- one encoder feeds them all.
+        if not regions:
+            regions = list(REGIONS)
+    elif fault_id in DELIVERY_FAULTS:
+        impact_ratio = _peak_rebuffer(regions)
+        basis = (f"delivery fault: measured peak rebuffer_ratio "
+                 f"{impact_ratio:.4f} over the incident window")
+    else:
+        impact_ratio = 0.0
+        basis = f"no impact model for fault {fault_id!r}"
+
     sessions_per_region = int(os.environ.get("CLIENTS_PER_REGION", "67"))
-    sessions = sessions_per_region * max(0, affected_regions)
+    sessions = sessions_per_region * len(regions)
     minutes = max(0.0, duration_seconds) / 60.0
-    lost = sessions * minutes * max(0.0, min(rebuffer_ratio, 1.0))
+    lost = sessions * minutes * max(0.0, min(impact_ratio, 1.0))
     return {
         "viewer_minutes_lost": round(lost, 1),
         "sessions_affected": sessions,
+        "affected_regions": regions,
         "incident_minutes": round(minutes, 2),
-        "impact_ratio_used": rebuffer_ratio,
+        "impact_ratio_used": round(impact_ratio, 4),
+        "impact_basis": basis,
         "assumptions": [
             f"{sessions_per_region} sessions per region (the modeled fleet, "
             "not real viewers)",
+            "region list and impact ratio derived in code from the diagnosis, "
+            "not supplied by the model",
             "the impact ratio is applied across the whole incident, which "
             "OVERSTATES loss if the fault ramped in gradually",
             "a rebuffering viewer is treated as fully lost for that fraction "

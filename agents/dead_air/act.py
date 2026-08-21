@@ -175,16 +175,11 @@ Work in this order:
    breaching, call verify_recovery ONCE more before concluding -- recovery can
    lag -- and then report what you found.
 
-3. Call estimate_viewer_impact. Choosing impact_ratio is a real judgement, and
-   the wrong choice produces the most misleading number in the whole record:
-
-   - delivery fault -> pass the peak rebuffer_ratio. Viewers lost that fraction
-     of their viewing time.
-   - content fault (black_source, ladder_mismatch) -> pass 1.0. rebuffer_ratio
-     was 0.0 throughout because nothing stalled; the bytes arrived perfectly
-     and carried the wrong picture. Passing 0.0 would report "0.0
-     viewer-minutes lost" for a total blackout, which is exactly backwards --
-     every viewer lost the picture for the entire incident.
+3. Call estimate_viewer_impact with the diagnosed fault_id and the incident
+   duration in seconds. That is all it takes -- the affected region list and the
+   impact ratio are derived in code from the diagnosis, deliberately, because
+   the impact ratio is the number a model most reliably gets backwards. Report
+   its result as returned; do not adjust the arithmetic.
 
 4. Call annotate_dashboard with a concise incident note. Pass
    started_at_epoch so the annotation lands at the INCIDENT time, not now --

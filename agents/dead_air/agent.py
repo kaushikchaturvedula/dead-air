@@ -67,8 +67,15 @@ import os
 from google.adk.agents import SequentialAgent
 from google.genai import types
 
+from google.adk.agents import LlmAgent
+
 from .act import phase4_act, phase5_record
 from .diagnose import phase3_diagnose
+from .observability import (
+    install_agent_tracing,
+    record_llm_usage,
+    record_tool_call,
+)
 from .scope import phase1_scope
 from .see import phase2_see
 
@@ -207,6 +214,24 @@ def _human_approval_gate(callback_context) -> types.Content | None:
 phase2_see.before_agent_callback = _skip_visual_inspection
 phase5_record.before_agent_callback = _human_approval_gate
 
+
+def _instrument(agent):
+    """Attach the reflexive callbacks to every LlmAgent in the tree.
+
+    ADK already spans LLM and tool calls; these callbacks add the GenAI usage
+    attributes that Grafana Cloud AI Observability reads. Done here rather than
+    on each agent so a new phase cannot be added un-instrumented -- the agent
+    that watches a plant should not have blind spots in itself.
+    """
+    for sub in getattr(agent, "sub_agents", None) or []:
+        if isinstance(sub, LlmAgent):
+            sub.after_model_callback = record_llm_usage
+            if getattr(sub, "tools", None):
+                sub.before_tool_callback = record_tool_call
+        _instrument(sub)
+
+install_agent_tracing()
+
 root_agent = SequentialAgent(
     name="dead_air",
     description=(
@@ -216,3 +241,5 @@ root_agent = SequentialAgent(
     sub_agents=[phase1_scope, phase2_see, phase3_diagnose, phase4_act,
                 phase5_record],
 )
+
+_instrument(root_agent)

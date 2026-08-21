@@ -65,11 +65,43 @@ RETRY = types.HttpRetryOptions(
 )
 
 
+# Per-request ceiling, in milliseconds.
+#
+# Retry config only covers requests that RETURN an error status. A connection
+# that simply hangs never produces one, so no amount of retry policy helps: a
+# single generate_content call stalled for 889 SECONDS and took the whole
+# investigation down with it, until the 900s run ceiling aborted everything.
+# The agent's own trace showed it as one span swallowing the entire run while
+# its three sibling specialists finished in ~30s each.
+#
+# 120s is generous for any call this agent makes -- the slowest observed
+# legitimate call is a few seconds -- while turning an infinite hang into a
+# fast failure that the retry policy above can then act on.
+REQUEST_TIMEOUT_MS = int(os.environ.get("DEADAIR_LLM_TIMEOUT_MS", "120000"))
+
+
 def build_model() -> Gemini:
-    """A Gemini model with backoff, for every agent in the pipeline."""
+    """A Gemini model with backoff AND a per-request timeout.
+
+    Both are needed and they cover different failures: retry_options handles a
+    request that comes back wrong, the timeout handles one that never comes
+    back at all.
+
+    NOTE the timeout has to travel via client_kwargs, because ADK builds its own
+    HttpOptions and then does kwargs.update(client_kwargs) -- so passing
+    http_options here REPLACES ADK's rather than merging. retry_options is
+    therefore re-supplied on this object; what is given up is ADK's internal
+    tracking headers, which are telemetry-only and cost nothing operationally.
+    """
     return Gemini(
         model=MODEL_NAME,
         retry_options=RETRY,
+        client_kwargs={
+            "http_options": types.HttpOptions(
+                retry_options=RETRY,
+                timeout=REQUEST_TIMEOUT_MS,
+            ),
+        },
     )
 
 

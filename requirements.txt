@@ -9,3 +9,15 @@ google-genai
 mcp>=1.24,<2
 python-dotenv
 httpx
+
+# Reflexive layer: the agent exports its own traces to Grafana Cloud AI
+# Observability (brief §1). opentelemetry-sdk already arrives transitively with
+# google-adk, which emits OTel spans but ships no exporter -- this supplies the
+# missing exporter. OpenTelemetry is vendor-neutral instrumentation, not an
+# agent framework or a model, so it does not touch the Google-only runtime rule.
+opentelemetry-exporter-otlp-proto-http
+
+# Deterministic rung-resolution measurement (docs/vision-spike.md). Vision
+# cannot detect ladder_mismatch; this is the code path that decides it.
+numpy
+pillow
