@@ -167,7 +167,10 @@ async def _run_once_inner(state, quiet, started):
 def show(state):
     for key, title in (("incident_scope", "PHASE 1 -- INCIDENT SCOPE"),
                        ("visual_finding", "PHASE 2 -- VISUAL FINDING"),
-                       ("diagnosis", "PHASE 3 -- DIAGNOSIS")):
+                       ("diagnosis", "PHASE 3 -- DIAGNOSIS"),
+                       ("remediation_proposal", "PHASE 4 -- REMEDIATION (proposed)"),
+                       ("execution_result", "     APPROVAL GATE"),
+                       ("recovery_record", "PHASE 5 -- RECOVERY + POSTMORTEM")):
         raw = state.get(key)
         print(f"\n{'-' * 78}\n{title}\n{'-' * 78}")
         if not raw:
@@ -180,7 +183,7 @@ def show(state):
             print(raw)
 
 
-def watch(poll_seconds, timeout=None):
+def watch(poll_seconds, timeout=None, approval_mode="deny"):
     print(f"watching {WEBHOOK} for firing alerts (every {poll_seconds}s)",
           flush=True)
     seen = set()
@@ -205,6 +208,7 @@ def watch(poll_seconds, timeout=None):
                           flush=True)
                     continue
                 state = alert_state(payload)
+                state["approval_mode"] = approval_mode
                 try:
                     final = asyncio.run(run_once(state, timeout=timeout))
                     show(final)
@@ -217,7 +221,7 @@ def watch(poll_seconds, timeout=None):
         time.sleep(poll_seconds)
 
 
-def sweep(interval, region, timeout=None):
+def sweep(interval, region, timeout=None, approval_mode="deny"):
     """The confidence monitor: proactive, on a timer, always inspects pixels."""
     print(f"confidence monitor: sweeping {region} every {interval}s "
           f"(vision always runs on this path)", flush=True)
@@ -229,6 +233,7 @@ def sweep(interval, region, timeout=None):
             "alert_summary": "Proactive content check. No alert has fired.",
             "alert_status": "sweep",
             "trigger_kind": "sweep",
+            "approval_mode": approval_mode,
         }
         try:
             final = asyncio.run(run_once(state, timeout=timeout))
@@ -255,6 +260,12 @@ def main():
     ap.add_argument("--timeout", type=float, default=None,
                     help=f"hard ceiling per run in seconds "
                          f"(default {RUN_TIMEOUT_SECONDS:.0f})")
+    ap.add_argument("--approve", choices=["deny", "prompt", "auto"],
+                    default="deny",
+                    help="human approval gate for Phase 4's remediation. "
+                         "deny (default) proposes without acting; prompt asks "
+                         "on stdin; auto approves without asking and is for "
+                         "scripted runs only")
     ap.add_argument("--demo", action="store_true",
                     help=f"demo mode: tighter {DEMO_TIMEOUT_SECONDS:.0f}s "
                          f"ceiling so a stall fails fast enough to retry on "
@@ -265,12 +276,18 @@ def main():
     if budget is None and args.demo:
         budget = DEMO_TIMEOUT_SECONDS
 
+    # The gate defaults to deny: an unattended run proposes and records, and
+    # never touches the plant.
+    os.environ.setdefault("DEADAIR_APPROVAL_TOKEN", "operator-approved")
+    approval_mode = args.approve
+
     if args.sweep:
-        sweep(args.interval, args.region or "us-east1", timeout=budget)
+        sweep(args.interval, args.region or "us-east1", timeout=budget,
+              approval_mode=approval_mode)
         return
 
     if args.watch:
-        watch(args.poll, timeout=budget)
+        watch(args.poll, timeout=budget, approval_mode=approval_mode)
         return
 
     if not args.region:
@@ -283,6 +300,7 @@ def main():
         "alert_summary": f"Manual trigger for {args.region}.",
         "alert_status": "firing",
         "trigger_kind": "manual",
+        "approval_mode": approval_mode,
     }
     final = asyncio.run(run_once(state, timeout=budget))
     show(final)

@@ -190,3 +190,129 @@ class Diagnosis(BaseModel):
     recommended_action: str = Field(
         default="",
         description="The remediation to propose. Phase 4 gates it on a human.")
+
+
+class RemediationProposal(BaseModel):
+    """Phase 4 output: exactly ONE remediation, proposed and not executed.
+
+    The gate is structural, not advisory. Nothing in this object executes
+    anything; it is a request for permission that a human answers. An agent that
+    can restart a production encoder on its own judgement is a liability, and
+    the whole value of this phase is that the decision to act stays with a
+    person while the analysis behind it does not.
+    """
+
+    action_id: Literal[
+        "restart_encoder_with_healthy_source",
+        "restore_missing_rendition",
+        "drain_region_from_rotation",
+        "clear_packager_segment_gap",
+        "reencode_mismatched_rung",
+        "no_action_required",
+    ] = Field(description="Exactly one action. Never a list.")
+
+    human_summary: str = Field(
+        description="What will happen, in one sentence an on-call engineer can "
+                    "approve or reject without reading the rest.")
+    target: str = Field(
+        default="",
+        description="What the action operates on -- a region, a rendition, or "
+                    "the encoder.")
+    command: str = Field(
+        default="",
+        description="The exact command that would run, so a human can inspect "
+                    "it before approving. It is NOT run by this phase.")
+
+    justification: str = Field(
+        description="Why this action follows from the diagnosis, citing the "
+                    "evidence that decided it.")
+    expected_effect: str = Field(
+        description="What should change if this works, in terms of a metric "
+                    "that Phase 5 can then verify.")
+    slo_to_verify: Literal["rebuffer_ratio", "visual_frame_check",
+                           "both"] = Field(
+        default="rebuffer_ratio",
+        description="How Phase 5 confirms recovery. CONTENT faults "
+                    "(black_source, ladder_mismatch) MUST use "
+                    "visual_frame_check: rebuffer_ratio never moved for them, "
+                    "so it would report recovery on a still-black stream. "
+                    "Delivery faults use rebuffer_ratio.")
+
+    blast_radius: str = Field(
+        description="What else this touches. An encoder restart interrupts "
+                    "EVERY region, which is a materially different decision "
+                    "from draining one edge.")
+    reversible: bool = Field(
+        default=True, description="Whether the action can be undone.")
+    risk_if_wrong: str = Field(
+        description="What happens if the diagnosis was wrong and this runs "
+                    "anyway. This is the sentence the human is really "
+                    "approving against.")
+
+    requires_human_approval: bool = Field(
+        default=True,
+        description="Always true. Present so the gate is visible in the "
+                    "artifact rather than implied by control flow.")
+    approval_status: Literal["pending", "approved", "rejected", "auto_skipped"] = "pending"
+
+
+class RecoveryRecord(BaseModel):
+    """Phase 5 output: did it actually recover, and the postmortem.
+
+    An agent that declares victory without re-querying is worse than one that
+    does nothing, because it closes the incident. Recovery is asserted only
+    from a fresh measurement taken after the action.
+    """
+
+    action_taken: str
+    action_executed: bool = Field(
+        default=False,
+        description="False when the human rejected, or when the run was a "
+                    "dry run. Everything below is still recorded.")
+
+    slo_name: str = "rebuffer_ratio"
+    slo_threshold: float = 0.02
+    slo_before: Optional[float] = None
+    slo_after: Optional[float] = None
+    recovered: bool = Field(
+        default=False,
+        description="True only when a re-query after the action shows the SLO "
+                    "back within threshold. Never inferred from the action "
+                    "having been performed.")
+    verification_attempts: int = 0
+    still_degraded_reason: str = Field(
+        default="",
+        description="If not recovered, what the re-query actually showed. The "
+                    "incident stays OPEN.")
+
+    annotation_created: bool = False
+    annotation_id: str = ""
+    incident_id: str = Field(
+        default="", description="Incident record id, if one was written.")
+    incident_backend: Literal["grafana-irm", "annotation-fallback", "none"] = (
+        Field(default="none",
+              description="WHERE the incident was recorded. IRM is not enabled "
+                          "on every stack; when it is unavailable the record "
+                          "falls back to a tagged annotation. Reporting an id "
+                          "without saying which backend produced it implies an "
+                          "IRM incident exists when it may not."))
+
+    # The postmortem
+    timeline: list[str] = Field(
+        default_factory=list,
+        description="Timestamped sequence from detection to resolution.")
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="The measurements that established the diagnosis.")
+    root_cause: str = ""
+    mttr_seconds: Optional[float] = Field(
+        default=None,
+        description="Detection to verified recovery. Not to action -- an action "
+                    "that did not work has not repaired anything.")
+    viewer_minutes_lost: Optional[float] = Field(
+        default=None,
+        description="Estimated. rebuffer_ratio x affected sessions x duration. "
+                    "State the assumptions; this is an estimate, not a "
+                    "measurement.")
+    postmortem: str = Field(
+        default="", description="The written postmortem, markdown.")

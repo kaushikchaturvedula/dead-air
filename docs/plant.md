@@ -524,7 +524,28 @@ problem. The emitter also carries `deadair_cardinality_canary`, which is how
 It carries **no alert** — the only alert is L3's `rebuffer_ratio`. The Step 1
 placeholder that once watched this gauge is deleted on every `make provision`.
 
-## Step 5 — cloud deployment (not started, spends credits)
+## Correction to brief §5: `e2-medium` is wrong for L1
+
+§5 specifies an `e2-medium` for the encoder VM. **It cannot hold the ladder.**
+
+`e2-medium` reports `isSharedCpu: True` — 2 vCPU of burst against roughly 1
+vCPU sustained — and ffmpeg needs ~1.6 cores for four 1080p rungs. The failure
+is gradual, which is what makes it dangerous:
+
+| Condition | encoder_fps |
+| --- | --- |
+| e2-medium, idle (bursting) | 29.3 |
+| e2-medium, 201 viewers | 19.2 |
+| e2-medium, burst credits depleted | 15.8 |
+| **e2-standard-2 (dedicated cores)** | **28.7** |
+
+It looks healthy on first inspection and decays over minutes, so a smoke test
+passes and the demo degrades on camera. **Use `e2-standard-2` as the minimum.**
+
+Measured on GCE 2026-08-20 under the full 201-viewer fleet; see
+[cloud-deployment-risk.md](cloud-deployment-risk.md).
+
+## Step 5 — cloud deployment (step 1 done, see cloud-deployment-risk.md)
 
 GCE origin first, then the three Cloud Run edges — in that order, because an
 edge needs a publicly reachable origin. Nothing else is blocked on it: the
