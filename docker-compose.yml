@@ -151,7 +151,15 @@ services:
       dockerfile: viewers/Dockerfile
     container_name: deadair-viewers
     environment:
-      EDGES: "us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080"
+      # Overridable so the fleet can be pointed at the Cloud Run edges without
+      # editing this file:
+      #   EDGES="us-east1=https://...run.app,..." docker compose up -d viewers
+      # This was hardcoded until cloud step 2, which meant the env var was
+      # silently ignored and the fleet kept pulling from the LOCAL edges while
+      # the cloud edges sat idle -- a null measurement that looks like a working
+      # one. docs/cloud-deployment-risk.md called region "configuration, not
+      # code"; for this file it was code.
+      EDGES: "${EDGES:-us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080}"
       # 67 x 3 regions = 201 sessions, matching §5's "~200 modeled clients".
       # Measured on a 10-core / 8GB-Docker laptop alongside a 4-rung 1080p
       # encoder and three edges: load 6.96, 1.2GB, and zero self-inflicted
@@ -182,7 +190,15 @@ services:
     container_name: deadair-loadgen
     profiles: ["loadgen"]
     environment:
-      EDGES: "us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080"
+      # Overridable so the fleet can be pointed at the Cloud Run edges without
+      # editing this file:
+      #   EDGES="us-east1=https://...run.app,..." docker compose up -d viewers
+      # This was hardcoded until cloud step 2, which meant the env var was
+      # silently ignored and the fleet kept pulling from the LOCAL edges while
+      # the cloud edges sat idle -- a null measurement that looks like a working
+      # one. docs/cloud-deployment-risk.md called region "configuration, not
+      # code"; for this file it was code.
+      EDGES: "${EDGES:-us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080}"
       CLIENTS_PER_EDGE: "${CLIENTS_PER_EDGE:-3}"
     depends_on:
       - edge-us-east1

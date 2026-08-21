@@ -21,9 +21,15 @@ set -euo pipefail
 PROJECT="${DEADAIR_GCP_PROJECT:-rich-wavelet-476502-k4}"
 ZONE="${DEADAIR_GCP_ZONE:-us-central1-a}"
 VM="${DEADAIR_VM_NAME:-deadair-origin}"
-# §5 specifies e2-medium. Whether a 4-rung 1080p ladder actually holds realtime
-# on 2 vCPU is itself one of the unknowns this step is meant to answer.
-MACHINE="${DEADAIR_MACHINE:-e2-medium}"
+# §5 specifies e2-medium. Step 1 ANSWERED that question and the answer was no:
+# e2-medium reports isSharedCpu, and the 4-rung 1080p ladder falls off realtime
+# on it -- 29.3 fps idle, 19.2 fps under 201 viewers, against a 30 fps source.
+# See docs/cloud-deployment-risk.md finding 2.
+#
+# This default said e2-medium until cloud step 2, which is how a VM came back up
+# shared-core and served the ladder at 25.1 fps. A finding that lives only in a
+# doc is a finding that gets re-discovered; it belongs in the default.
+MACHINE="${DEADAIR_MACHINE:-e2-standard-2}"
 FW_RULE="deadair-allow-origin"
 
 # Scoped to the operator's IP rather than 0.0.0.0/0. The edges and Alloy both

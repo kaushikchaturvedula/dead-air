@@ -1,0 +1,23 @@
+# Cloud Build config for the edge image.
+#
+# Needed because `gcloud builds submit --tag` insists on a Dockerfile at the
+# root of the build context, and ours is at edge/Dockerfile while the context
+# has to be ./plant so the shared tracer (shared/deadair_trace.py) can be
+# copied in. A config file is the supported way to say "this context, that
+# Dockerfile" without duplicating either.
+#
+# Substitution _IMAGE is supplied by scripts/cloud_edges.sh.
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=edge/Dockerfile
+      - --tag=${_IMAGE}
+      - .
+
+images:
+  - ${_IMAGE}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
