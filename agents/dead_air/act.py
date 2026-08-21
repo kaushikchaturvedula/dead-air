@@ -94,6 +94,11 @@ If the diagnosis is no_fault_detected, propose no_action_required and say so
 plainly. Proposing an action against a healthy plant is worse than proposing
 nothing.""",
     tools=[propose_remediation],
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="act_investigation",
 )
 
@@ -122,6 +127,11 @@ Rules:
 - human_summary is the one sentence someone approves or rejects on. Write it
   for someone who has not read the diagnosis.""",
     output_schema=RemediationProposal,
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="remediation_proposal",
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,
@@ -196,6 +206,11 @@ Report every tool error verbatim. Never claim an annotation or incident was
 created if the tool said otherwise.""",
     tools=[verify_recovery, verify_visual_recovery, annotate_dashboard,
            record_incident, estimate_viewer_impact],
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="record_investigation",
 )
 
@@ -259,6 +274,11 @@ That last section is the point of the whole system. For a content fault, state
 plainly that every delivery metric stayed green and the fault was only visible
 in the pixels.""",
     output_schema=RecoveryRecord,
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="recovery_record",
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,

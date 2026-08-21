@@ -348,6 +348,11 @@ equally. Set inspect_rendition to 1080p unless evidence points elsewhere.
 Do not overstate confidence. If the signals disagree, say so in scope_summary
 and lower the number.""",
     output_schema=IncidentScope,
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="incident_scope",
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,

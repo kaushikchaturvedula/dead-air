@@ -72,6 +72,11 @@ green while the screen is black.
 Report tool errors verbatim. If no frame could be fetched, say so -- do not
 guess at what it would have shown.""",
     tools=[get_stream_manifest, inspect_frame, check_rung_resolution],
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="see_investigation",
 )
 
@@ -110,6 +115,11 @@ Rules:
 visual_summary should be one an on-call engineer could paste into an incident
 channel.""",
     output_schema=VisualFinding,
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="visual_finding",
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,

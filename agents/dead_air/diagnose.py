@@ -76,6 +76,11 @@ Rules:
   gap, never an elimination. Report it as a gap.
 - Report tool errors verbatim.""",
     tools=[match_fault_signatures, collect_evidence],
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="diagnosis_investigation",
 )
 
@@ -123,6 +128,11 @@ Rules:
 
 operator_summary should read like the first message in an incident channel.""",
     output_schema=Diagnosis,
+    # Reads ONLY its templated inputs above, so the replayed session history is
+    # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own
+    # tool loop regardless (a tool response is authored by the agent, not by
+    # 'user', so it is never a turn boundary: functions.py:1302, contents.py:913).
+    include_contents="none",
     output_key="diagnosis",
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,
