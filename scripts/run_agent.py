@@ -70,8 +70,13 @@ RUN_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_RUN_TIMEOUT", "900"))
 # measures 543s, with scope alone taking 281s. A 300s ceiling would have
 # aborted a perfectly healthy demo run -- demo mode killing the demo.
 #
-# 900s sweep-path measured -> 750s gives ~40% headroom over the slowest observed
-# full run while still failing fast enough to retry a take.
+# 543s slowest COMPLETED sweep-path run -> 750s, ~38% headroom, while still
+# failing fast enough to retry a take.
+#
+# Deliberately NOT derived from 900s. Nothing has ever completed in 900s: that
+# is the backstop above, and the only runs to reach it were the forced-calling
+# loop that hung and got aborted (see act.py, model.py). Sizing a demo ceiling
+# off an abort would be calibrating against a hang instead of against work.
 DEMO_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_DEMO_TIMEOUT", "750"))
 
 

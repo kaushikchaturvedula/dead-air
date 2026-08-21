@@ -148,9 +148,11 @@ def screen_live_segment(region: str, rendition: str = "1080p") -> dict:
         Stage 0 verdict, plus the segment it screened.
     """
     import tempfile
+    import time
 
     from .video_tools import _edge, _http_get
 
+    t0 = time.monotonic()
     base = _edge(region)
     try:
         playlist = _http_get(f"{base}/hls/{rendition}/index.m3u8").decode(
@@ -158,16 +160,19 @@ def screen_live_segment(region: str, rendition: str = "1080p") -> dict:
         segs = [l.strip() for l in playlist.splitlines()
                 if l.strip().endswith(".ts")]
         if not segs:
-            return {"suspect": False, "reason": "error",
-                    "error": f"no segments for {rendition} at {region}",
-                    "measurements": {}}
+            return _published({"suspect": False, "reason": "error",
+                               "error": f"no segments for {rendition} at {region}",
+                               "measurements": {}},
+                              region, rendition, time.monotonic() - t0)
         seg = segs[-1]
         with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as fh:
             fh.write(_http_get(f"{base}/hls/{rendition}/{seg}"))
             tmp = fh.name
     except Exception as exc:                            # noqa: BLE001
-        return {"suspect": False, "reason": "error", "measurements": {},
-                "error": f"fetch failed: {type(exc).__name__}: {exc}"}
+        return _published({"suspect": False, "reason": "error",
+                           "measurements": {},
+                           "error": f"fetch failed: {type(exc).__name__}: {exc}"},
+                          region, rendition, time.monotonic() - t0)
 
     try:
         verdict = screen_media(tmp)
@@ -179,6 +184,22 @@ def screen_live_segment(region: str, rendition: str = "1080p") -> dict:
     verdict["region"] = region
     verdict["rendition"] = rendition
     verdict["segment"] = seg
+    return _published(verdict, region, rendition, time.monotonic() - t0)
+
+
+def _published(verdict, region, rendition, seconds):
+    """Publish the verdict to Mimir, then hand it back unchanged.
+
+    Wraps every return path out of screen_live_segment, including the error
+    ones -- a screen that failed is a fact about content health too, and a
+    panel that silently stops updating is the ambiguity this whole plant exists
+    to remove.
+    """
+    try:
+        from .content_metrics import record_screen
+        record_screen(verdict, region, rendition, seconds)
+    except Exception:                                   # noqa: BLE001
+        pass                # record_screen already logs; never fail a screen
     return verdict
 
 

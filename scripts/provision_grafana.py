@@ -88,25 +88,40 @@ def ensure_folder(gf):
         print(f"  folder {FOLDER_UID!r} created")
 
 
-# Panel placement, applied after the panels are built. Reading order is the
-# plant itself -- L1 encoder, L2 edges, L3 viewers, then logs -- with the
-# synthetic pipe canary last and collapsed, because it is infrastructure for
-# diagnosing the observability stack rather than a signal about the stream.
+# Panel placement, applied after the panels are built.
+#
+# CONTENT IS FIRST, ABOVE THE PLANT. Everything below it -- encoder fps, edge
+# TTFB, rebuffer ratio -- describes DELIVERY, and all of it stays green while
+# the channel is showing black, because none of it looks at the picture. Putting
+# the content row at the top means the contradiction is visible without
+# scrolling: one row red, every row under it green, in a single frame.
+#
+# Then the plant in its own order -- L1 encoder, L2 edges, L3 viewers, logs --
+# with the synthetic pipe canary last and collapsed, because it is
+# infrastructure for diagnosing the observability stack rather than a signal
+# about the stream.
 LAYOUT = {
-    10: (0, 0, 24, 1),                                    # row: L1
-    11: (0, 1, 8, 8),    12: (8, 1, 16, 8),
-    13: (0, 9, 6, 5),    14: (6, 9, 6, 5),
-    20: (0, 14, 24, 1),                                   # row: L2
-    21: (0, 15, 16, 9),  22: (16, 15, 8, 9),
-    23: (0, 24, 12, 8),  24: (12, 24, 12, 8),
-    30: (0, 32, 24, 1),                                   # row: L3
-    31: (0, 33, 16, 9),  32: (16, 33, 8, 9),
-    33: (0, 42, 12, 8),  34: (12, 42, 12, 8),
-    15: (0, 50, 24, 10),                                  # origin access log
-    40: (0, 60, 24, 1),                                   # row: L0 (collapsed)
-    1: (0, 61, 16, 8),   2: (16, 61, 8, 8),  3: (0, 69, 24, 7),
+    50: (0, 0, 24, 1),                                    # row: content truth
+    51: (0, 1, 12, 9),   52: (12, 1, 6, 9),  53: (18, 1, 6, 9),
+    10: (0, 10, 24, 1),                                   # row: L1
+    11: (0, 11, 8, 8),   12: (8, 11, 16, 8),
+    13: (0, 19, 6, 5),   14: (6, 19, 6, 5),
+    20: (0, 24, 24, 1),                                   # row: L2
+    21: (0, 25, 16, 9),  22: (16, 25, 8, 9),
+    23: (0, 34, 12, 8),  24: (12, 34, 12, 8),
+    30: (0, 42, 24, 1),                                   # row: L3
+    31: (0, 43, 16, 9),  32: (16, 43, 8, 9),
+    33: (0, 52, 12, 8),  34: (12, 52, 12, 8),
+    15: (0, 60, 24, 10),                                  # origin access log
+    40: (0, 70, 24, 1),                                   # row: L0 (collapsed)
+    1: (0, 71, 16, 8),   2: (16, 71, 8, 8),  3: (0, 79, 24, 7),
 }
 CANARY_PANEL_IDS = [1, 2, 3]
+
+# Stage 0's black threshold, kept in step with agents/dead_air/content_screen.py
+# (SCREEN_BLACK_YAVG_MAX). Measured separation is ~17 black vs ~125 healthy, so
+# 40 sits in a 100-unit empty gap -- see docs/content-screen.md.
+CONTENT_LUMA_THRESHOLD = 40
 
 
 def apply_layout(panels):
@@ -147,6 +162,139 @@ def dashboard_model():
         }
 
     panels = [
+            # --- CONTENT: the only row that looks at the picture ------------
+            {
+                "id": 50,
+                "type": "row",
+                "title": "CONTENT — what the picture actually shows "
+                         "(agent Stage 0, no model)",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+                "collapsed": False,
+                "panels": [],
+            },
+            {
+                "id": 51,
+                "type": "timeseries",
+                "title": "Content luma — the signal no delivery metric carries",
+                "description": (
+                    "Mean luma (ffmpeg signalstats YAVG) of the newest segment "
+                    "at the edge, measured by the agent's Stage 0 screen. This "
+                    "is arithmetic, not a model: ~1.3s per check, no LLM call.\n\n"
+                    "Healthy reads ~125. A black source reads ~17. The "
+                    "threshold at 40 sits in a 100-unit empty gap — 69/69 "
+                    "fixtures classify correctly with zero false positives.\n\n"
+                    "WHY IT MATTERS: when this line falls off a cliff, every "
+                    "panel below it stays green. The encoder is still encoding, "
+                    "segments still arrive on time, viewers still are not "
+                    "rebuffering. Delivery is perfect and the channel is dead. "
+                    "That contradiction is what DEAD AIR exists to catch, and "
+                    "you are looking at both halves of it at once."
+                ),
+                "gridPos": {"h": 9, "w": 12, "x": 0, "y": 1},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("deadair_content_luma_avg",
+                                   "{{region}} / {{rendition}}")],
+                "fieldConfig": {
+                    "defaults": {
+                        "custom": {"lineWidth": 3, "fillOpacity": 10,
+                                   "spanNulls": False},
+                        "min": 0, "max": 255, "unit": "none",
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                # Inverted against every other panel here:
+                                # LOW is the failure, so red is the floor.
+                                {"color": "red", "value": None},
+                                {"color": "green", "value": CONTENT_LUMA_THRESHOLD},
+                            ],
+                        },
+                    },
+                    "overrides": [],
+                },
+                "options": {
+                    "legend": {"displayMode": "list", "placement": "bottom"},
+                    "tooltip": {"mode": "multi"},
+                },
+            },
+            {
+                "id": 52,
+                "type": "stat",
+                "title": "What the picture shows",
+                "description": (
+                    "Stage 0's verdict on the newest segment. Goes red on a "
+                    "black or frozen source — the two failures that are "
+                    "invisible to every delivery metric in this dashboard."
+                ),
+                "gridPos": {"h": 9, "w": 6, "x": 12, "y": 1},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target("max(deadair_content_suspect)", "content")],
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "thresholds"},
+                        "mappings": [{
+                            "type": "value",
+                            "options": {
+                                "0": {"text": "PICTURE OK", "index": 0},
+                                "1": {"text": "DEAD AIR", "index": 1},
+                            },
+                        }],
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"color": "green", "value": None},
+                                {"color": "red", "value": 1},
+                            ],
+                        },
+                    },
+                    "overrides": [],
+                },
+                "options": {
+                    "colorMode": "background",
+                    "graphMode": "none",
+                    "textMode": "value",
+                    "reduceOptions": {"calcs": ["lastNotNull"]},
+                },
+            },
+            {
+                "id": 53,
+                "type": "stat",
+                "title": "What delivery reports, same moment",
+                "description": (
+                    "The worst rebuffer ratio across all regions — the plant's "
+                    "own health verdict, and the signal the only alert rule "
+                    "fires on.\n\n"
+                    "Placed HERE, beside the content verdict, on purpose. "
+                    "During a black-source fault this stays green while the "
+                    "panel to its left is red. Delivery telemetry is not wrong; "
+                    "it is answering a different question, and nothing in a "
+                    "conventional stack asks the one that matters."
+                ),
+                "gridPos": {"h": 9, "w": 6, "x": 18, "y": 1},
+                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
+                "targets": [target(f"max({REBUFFER_EXPR})", "worst region")],
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "thresholds"},
+                        "unit": "percentunit",
+                        "decimals": 2,
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"color": "green", "value": None},
+                                {"color": "red", "value": REBUFFER_THRESHOLD},
+                            ],
+                        },
+                    },
+                    "overrides": [],
+                },
+                "options": {
+                    "colorMode": "background",
+                    "graphMode": "area",
+                    "textMode": "value",
+                    "reduceOptions": {"calcs": ["lastNotNull"]},
+                },
+            },
+
             {
                 "id": 1,
                 "type": "timeseries",

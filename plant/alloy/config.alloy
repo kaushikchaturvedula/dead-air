@@ -290,8 +290,31 @@ otelcol.receiver.otlp "plant" {
   }
 
   output {
-    traces = [otelcol.processor.batch.plant.input]
+    traces  = [otelcol.processor.batch.plant.input]
+    // The agent's Stage 0 content screen pushes its luma measurements here as
+    // OTLP metrics -- see agents/dead_air/content_metrics.py. Push rather than
+    // scrape because the agent is an intermittent CLI process: a scrape target
+    // would be down more often than up, and every gap would render as `up=0`,
+    // an observability artefact indistinguishable from a real outage.
+    metrics = [otelcol.exporter.prometheus.content.input]
   }
+}
+
+// ---------------------------------------------------------------------------
+// Agent content metrics -> the SAME cardinality guard as the scraped plant
+// ---------------------------------------------------------------------------
+// Deliberately not routed straight to remote_write. Content health is a plant
+// signal like any other and gets the same allowlist treatment; its labels
+// (region, rendition) are already permitted, so nothing has to be widened to
+// let it through. A signal that forced the guard open would be the wrong
+// signal.
+otelcol.exporter.prometheus "content" {
+  forward_to = [prometheus.relabel.cardinality_guard.receiver]
+
+  // OTLP resource attributes would otherwise be flattened onto every series as
+  // labels. The labelkeep backstop below would strip them anyway, but dropping
+  // them here keeps `target_info` out of Mimir entirely.
+  resource_to_telemetry_conversion = false
 }
 
 otelcol.processor.batch "plant" {
