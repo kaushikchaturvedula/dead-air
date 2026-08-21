@@ -257,6 +257,80 @@ context mid-run.
    fault. This agent's job is being *right* about broadcast faults; a fast wrong
    answer is worth nothing. Rejected in favour of the enforced byte cap in (4).
 
+---
+
+# Applied, and measured
+
+`include_contents='none'` is set on the nine downstream agents (all five
+synthesizers and all four tool-using investigators). **Not** on the four scope
+specialists: they are already branch-isolated from each other, and the context
+that grows inside them is their own tool loop, which this flag preserves — so it
+would buy nothing there.
+
+## Correctness first: 6/6, no regression
+
+`make diagnose-eval`, all five faults plus the healthy control, through the full
+five-phase agent:
+
+```
+PASS  healthy          fault=no_fault_detected  verdict=no_fault_detected
+PASS  black_source     fault=black_source       verdict=black_source
+PASS  ladder_mismatch  fault=ladder_mismatch    verdict=ladder_mismatch
+PASS  ladder_collapse  fault=ladder_collapse    verdict=ladder_collapse
+PASS  segment_gap      fault=segment_gap        verdict=segment_gap
+PASS  edge_latency     fault=edge_latency       verdict=edge_latency
+6/6 correct
+```
+
+Every case ran all 5/5 phases. No agent needed excluding: the per-agent template
+audit held, including the optional `{visual_finding?}` that carries Phase 2's
+verdict into Phase 3.
+
+## Like-for-like, same fault before and after
+
+| | wall | input tokens | USD |
+| --- | --- | --- | --- |
+| ladder_collapse before | 362.2s | 4,329,077 | $1.342 |
+| ladder_collapse after | **187.1s** (−48.3%) | **919,973** (−78.7%) | **$0.315** (−76.5%) |
+| segment_gap before | 568.9s | 4,573,692 | $1.415 |
+| segment_gap after | **243.8s** (−57.1%) | **555,140** (−87.9%) | **$0.204** (−85.6%) |
+
+All six cases after the change:
+
+| case | wall | input | output | ratio | USD |
+| --- | --- | --- | --- | --- | --- |
+| healthy | 142.0s | 613,669 | 13,415 | 45:1 | $0.218 |
+| black_source | 169.2s | 356,629 | 14,252 | 25:1 | $0.143 |
+| ladder_mismatch | 190.0s | 453,699 | 14,921 | 30:1 | $0.173 |
+| ladder_collapse | 187.1s | 919,973 | 15,733 | 58:1 | $0.315 |
+| segment_gap | 243.8s | 555,140 | 14,796 | 37:1 | $0.204 |
+| edge_latency | 322.1s | 587,422 | 15,850 | 37:1 | $0.216 |
+| **mean** | **209.0s** | **581,088** | 14,828 | **39:1** | **$0.211** |
+
+The input:output ratio went from **249-268:1 to 25-58:1**. Cost per
+investigation went from **~$1.38 to ~$0.21**.
+
+## Per-phase wall clock, from the traces
+
+| phase | before (2 runs) | after (mean of 6) |
+| --- | --- | --- |
+| 1 scope | 151.5s / 202.1s | **66.0s** |
+| 2 see | 0.0s / 86.7s | 13.8s |
+| 3 diagnose | 54.9s / 41.3s | 27.7s |
+| 4 act | 33.2s / 35.1s | **10.5s** |
+| 5 record | 122.6s / 203.7s | **91.0s** |
+
+**Phase 5 is now the largest phase**, having overtaken scope. That matches the
+earlier finding that record was always an equal-sized target; with the context
+tax removed from both, what is left in Phase 5 is real work — it calls
+`verify_recovery`, which deliberately waits for the plant to settle.
+
+## What did not change
+
+Output tokens barely moved (17.2k → 14.8k), which is the point: the agent is
+doing the same work and saying the same things. It was carrying freight, not
+context.
+
 ## The honest ceiling
 
 Scope is 35-42% of the run and Phase 5 is another 34-36%, so no scope-only change
