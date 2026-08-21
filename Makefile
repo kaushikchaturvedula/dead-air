@@ -222,6 +222,10 @@ agent-observability-check: ## Assert the agent's own spans actually REACH Tempo
 	@$(PY) scripts/check_agent_observability.py 2>&1 \
 	  | grep -v "Warning\|check_feature"
 
+agent-profile: ## Where an investigation's time went, read from its own traces
+	@$(PY) scripts/profile_agent_run.py $(TRACE) 2>&1 \
+	  | grep -v "Warning\|check_feature"
+
 agent-tools: ## Show which MCP tools each Phase-1 specialist is pinned to
 	@$(PY) scripts/show_agent_tools.py 2>&1 \
 	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
