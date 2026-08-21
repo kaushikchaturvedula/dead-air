@@ -137,3 +137,100 @@ across four phases rather than a scope problem.
 actual output. Roughly half is cache-read, so the billed figure is softer than
 the raw count — but cache hits still have to be transmitted and attended to, and
 latency is what the demo is judged on.
+
+---
+
+# Proposed, not yet applied
+
+## The 200k is dead weight, not context
+
+Every agent after Phase 1 already receives **100% of what it needs through
+instruction state-templating**, and templated instructions land in the
+**system instruction**, not in `contents`:
+
+* `instructions.py:108-111` — the templated instruction is appended via
+  `append_instructions`, i.e. to `system_instruction`.
+* `instructions.py:112-119` — the only path that puts a dynamic instruction into
+  `contents` also requires `agent.static_instruction` to be set. **The repo uses
+  `static_instruction` nowhere**, so that path is never taken.
+* The templated inputs are explicit and auditable: `scope.py:302-314`
+  (`{metrics_findings}` / `{logs_findings}` / `{traces_findings}` /
+  `{dashboard_findings}`), `see.py:38,86,89`, `diagnose.py:33,90,96`,
+  `act.py:73,108,111,145,148,210,213,219`.
+
+So the ~180k of replayed Loki lines and Tempo JSON is carried **in addition to**
+the findings each agent actually reads. Nothing downstream consumes it by
+design. It is pure freight.
+
+## The primitive, and why it is safe
+
+`LlmAgent.include_contents: Literal['default','none']`
+(`llm_agent.py:369`). Setting it to `'none'` swaps
+`_get_contents(all session events)` for `_get_current_turn_contents`
+(`contents.py:433-460`), which scans backward to the newest turn boundary
+(`contents.py:900-925`).
+
+The property that makes this safe rather than lobotomising:
+
+```python
+# functions.py:1302 -- a tool-response event is authored by the AGENT
+author=invocation_context.agent.name
+```
+
+and the boundary test is `event.author == 'user' or _is_other_agent_reply(...)`
+(`contents.py:913`). A tool response is therefore **never** a turn boundary, so
+an agent keeps every one of its own calls and responses and drops only prior
+phases. Contents can never go empty either — the user kickoff event is always a
+floor match.
+
+**Event compaction cannot substitute for this.** Its only call sites
+(`runners.py:637-660`) run *after* the invocation completes, so it cannot reduce
+context mid-run.
+
+## Ranked
+
+### Worth doing — the saving is measured and the risk is bounded
+
+1. **`include_contents='none'` on the four synthesizers** — `scope_synthesizer`,
+   `diagnose_synthesizer`, `act_synthesizer`, `record_synthesizer`. These have
+   `output_schema` and consume *only* templated state, so the dropped contents
+   are provably unread. Removes the ~200k tax from the four most expensive
+   single calls in the run.
+
+2. **Pre-resolve each `McpToolset` once at startup** rather than handing
+   `LlmAgent` a live toolset (`scope.py:56-65` and its four call sites at
+   `178,219,258,282`). Small (~7s) and low risk.
+
+### Measure before committing
+
+3. **`include_contents='none'` on the tool-using investigators**
+   (`diagnose_investigator`, `act_proposer`, `record_investigator`) **plus**
+   explicitly templating in the findings they currently pick up implicitly. The
+   saving is larger than (1), but the risk is real: if one of them is silently
+   relying on something in `contents`, it loses it. Requires a re-run of all six
+   fault cases to confirm diagnosis quality is unchanged.
+
+4. **A truncating `after_tool_callback`** capping each MCP response at a byte
+   budget with an explicit "truncated, narrow your selector" marker.
+   `agent.py:218-231` already sets `after_model_callback` and
+   `before_tool_callback`; `after_tool_callback` is unused. This is the only
+   proposal that also attacks the 60x growth *within* Phase 1. Risk is
+   medium-high and specific: the truncated tail could be the log line naming the
+   404'd URI, which is exactly what separates `segment_gap` from
+   `ladder_collapse`. Do not ship this without re-running both.
+
+### Rejected
+
+5. **Prompt-level query budgets** ("you have N calls, report call k of N").
+   Unenforced, and it cuts both ways — an agent told data is expensive may pull
+   `limit=1` and report "no example lines" where five would have identified the
+   fault. This agent's job is being *right* about broadcast faults; a fast wrong
+   answer is worth nothing. Rejected in favour of the enforced byte cap in (4).
+
+## The honest ceiling
+
+Scope is 35-42% of the run and Phase 5 is another 34-36%, so no scope-only change
+can win more than ~40%. The context fix is worth more than the scope fix
+*because* it applies to every phase at once — which is the actual reason to
+prefer it, not the raw token count.
+
