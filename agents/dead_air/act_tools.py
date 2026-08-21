@@ -280,12 +280,17 @@ def verify_visual_recovery(region: str, rendition: str = "1080p",
         dict with the frame verdict, the rung measurement, and whether the
         picture is genuinely healthy again.
     """
+    from .content_screen import screen_live_segment
     from .video_tools import check_rung_resolution, inspect_frame
 
     wait_seconds = max(0, min(int(wait_seconds), 180))
     if wait_seconds:
         time.sleep(wait_seconds)
 
+    # Stage 0 first: "is it still black" is arithmetic, and answering it with a
+    # model is both slower and less certain. Vision then says what the picture
+    # IS, which is the question worth a model.
+    screen = screen_live_segment(region, rendition)
     frame = inspect_frame(region, rendition)
     rung = check_rung_resolution(region)
     verdict = frame.get("classification", "no_frame_available")
@@ -293,8 +298,14 @@ def verify_visual_recovery(region: str, rendition: str = "1080p",
 
     picture_ok = verdict == "healthy"
     rung_ok = rung_verdict == "carries_expected_detail"
+    screen_ok = not screen.get("suspect")
     return {
         "check": "visual_frame_check",
+        "stage0_screen": {
+            "suspect": screen.get("suspect"),
+            "reason": screen.get("reason"),
+            "yavg_mean": (screen.get("measurements") or {}).get("yavg_mean"),
+        },
         "region": region,
         "rendition": rendition,
         "waited_seconds": wait_seconds,
@@ -304,7 +315,10 @@ def verify_visual_recovery(region: str, rendition: str = "1080p",
         "visual_evidence": frame.get("visual_evidence", "")[:300],
         "rung_resolution_verdict": rung_verdict,
         "rung_resolution_ratio": rung.get("ratio"),
-        "recovered": bool(picture_ok and rung_ok),
+        # All three must agree. The deterministic screen is included because a
+        # model that says "healthy" against a measurably black frame should not
+        # be able to close an incident on its own.
+        "recovered": bool(picture_ok and rung_ok and screen_ok),
         "note": ("recovered=false means viewers still are not seeing a correct "
                  "picture, regardless of what delivery metrics say. The "
                  "incident stays OPEN."),

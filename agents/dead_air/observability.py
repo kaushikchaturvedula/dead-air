@@ -40,6 +40,7 @@ exporter is added. OpenTelemetry is vendor-neutral instrumentation, not an agent
 framework or a model, so this does not touch the contest's Google-only rule.
 """
 
+import logging
 import os
 import threading
 
@@ -48,9 +49,12 @@ _ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
 _SERVICE = os.environ.get("OTEL_SERVICE_NAME", "deadair-agent")
 _ENABLED = os.environ.get("DEADAIR_AGENT_TRACING", "1") not in ("0", "false", "")
 
+logger = logging.getLogger("deadair.observability")
+
 _lock = threading.Lock()
 _installed = False
 _tracer = None
+_install_error = ""
 
 # Rough Vertex list pricing for gemini-3.7-flash, USD per 1M tokens. Cost is an
 # ESTIMATE derived from token counts, not a billing figure -- it exists so the
@@ -71,7 +75,7 @@ def install_agent_tracing() -> bool:
     missing exporter must never break an investigation -- observability that
     takes down the thing it observes is worse than none.
     """
-    global _installed, _tracer
+    global _installed, _tracer, _install_error
     with _lock:
         if _installed:
             return _tracer is not None
@@ -100,10 +104,42 @@ def install_agent_tracing() -> bool:
                 OTLPSpanExporter(endpoint=f"{_ENDPOINT}/v1/traces")))
             trace.set_tracer_provider(provider)
             _tracer = trace.get_tracer("deadair.agent")
+            logger.info("agent tracing active -> %s (service=%s)",
+                        _ENDPOINT, _SERVICE)
             return True
-        except Exception:                              # noqa: BLE001
+        except Exception as exc:                       # noqa: BLE001
+            # LOUD. A silently disabled reflexive layer shows an empty
+            # dashboard during the §7 demo beat with nothing explaining why --
+            # the same swallow-the-ImportError shape that made ADK's McpToolset
+            # vanish without a word on day one.
             _tracer = None
+            _install_error = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "REFLEXIVE LAYER DISABLED -- agent tracing failed to install: "
+                "%s. The agent still runs, but its own traces, token cost and "
+                "tool activity will NOT reach Grafana Cloud. Check that "
+                "opentelemetry-exporter-otlp-proto-http is installed and that "
+                "%s is reachable. Run `make agent-observability-check` to "
+                "confirm once fixed.", _install_error, _ENDPOINT)
             return False
+
+
+_warned = set()
+
+
+def _warn_once(where, exc):
+    """Report an instrumentation failure once per site, not once per span."""
+    if where in _warned:
+        return
+    _warned.add(where)
+    logger.warning("agent instrumentation error in %s (%s: %s). Telemetry for "
+                   "this path will be incomplete; the investigation continues.",
+                   where, type(exc).__name__, exc)
+
+
+def install_error() -> str:
+    """Why tracing is off, or empty string if it is on."""
+    return _install_error
 
 
 def _tracer_or_none():
@@ -152,8 +188,10 @@ def record_llm_usage(callback_context, llm_response):
             if agent_name is not None:
                 span.set_attribute("deadair.agent",
                                    getattr(agent_name, "name", str(agent_name)))
-    except Exception:                                  # noqa: BLE001
-        pass
+    except Exception as exc:                           # noqa: BLE001
+        # Never fail an investigation to record telemetry -- but say so once,
+        # rather than losing every token count in silence.
+        _warn_once("llm_usage", exc)
     return None
 
 
@@ -175,8 +213,8 @@ def record_tool_call(tool, args, tool_context):
         if span is not None and span.is_recording():
             span.set_attribute("gen_ai.tool.name", getattr(tool, "name", "?"))
             span.set_attribute("deadair.tool.arg_count", len(args or {}))
-    except Exception:                                  # noqa: BLE001
-        pass
+    except Exception as exc:                           # noqa: BLE001
+        _warn_once("tool_call", exc)
     return None
 
 
@@ -184,6 +222,9 @@ def usage_totals() -> dict:
     """What this process has spent so far. Estimated cost, real token counts."""
     with _lock:
         t = dict(_totals)
+    t["tracing_active"] = _tracer is not None
+    if _install_error:
+        t["tracing_error"] = _install_error
     t["usd"] = round(t["usd"], 4)
     t["note"] = ("cost is estimated from token counts at configured list "
                  "prices; token counts themselves are reported by Vertex")

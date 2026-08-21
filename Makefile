@@ -26,6 +26,7 @@ ALLOY_UI := http://localhost:12345
         player ladder black-source restore-source frame \
         edges edge-port chaos chaos-clear chaos-status \
         agent agent-watch agent-sweep agent-tools diagnose-eval diagnose-checks \
+        agent-observability-check screen-calibrate screen \
         mcp-up mcp-down clean
 
 help: ## Show available targets
@@ -205,6 +206,21 @@ diagnose-checks: ## Fast: score the deterministic checklist on all 6 cases, no m
 diagnose-eval: ## Full: drive all 5 faults + healthy control through the agent
 	@$(PY) -u scripts/diagnose_eval.py 2>&1 \
 	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
+
+screen: ## Stage 0 deterministic content screen on the live stream (no model)
+	@$(PY) -c "import sys,json,os; sys.path.insert(0,'agents'); \
+from dotenv import load_dotenv; load_dotenv('agents/grafana_probe/.env'); \
+from dead_air.content_screen import screen_live_segment; \
+print(json.dumps(screen_live_segment('$(or $(REGION),us-east1)'), indent=1))" \
+	  2>&1 | grep -v "Warning\|check_feature"
+
+screen-calibrate: ## Calibrate Stage 0 on fixtures (add LIVE=1 for live segments)
+	@$(PY) scripts/calibrate_content_screen.py $(if $(LIVE),--live,) 2>&1 \
+	  | grep -v "Warning\|check_feature"
+
+agent-observability-check: ## Assert the agent's own spans actually REACH Tempo
+	@$(PY) scripts/check_agent_observability.py 2>&1 \
+	  | grep -v "Warning\|check_feature"
 
 agent-tools: ## Show which MCP tools each Phase-1 specialist is pinned to
 	@$(PY) scripts/show_agent_tools.py 2>&1 \

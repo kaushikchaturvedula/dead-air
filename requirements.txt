@@ -15,9 +15,15 @@ httpx
 # google-adk, which emits OTel spans but ships no exporter -- this supplies the
 # missing exporter. OpenTelemetry is vendor-neutral instrumentation, not an
 # agent framework or a model, so it does not touch the Google-only runtime rule.
-opentelemetry-exporter-otlp-proto-http
+# Pinned: OTel has made breaking changes across majors, and a silently
+# incompatible exporter disables the reflexive layer rather than failing loudly.
+opentelemetry-exporter-otlp-proto-http>=1.40,<2
 
 # Deterministic rung-resolution measurement (docs/vision-spike.md). Vision
 # cannot detect ladder_mismatch; this is the code path that decides it.
-numpy
-pillow
+#
+# Pinned: numpy 2.x changed the C ABI and broke compiled dependents widely, and
+# this measurement is the sole authority on ladder_mismatch -- it must not
+# silently change behaviour under a transitive upgrade.
+numpy>=1.26,<3
+pillow>=10,<12

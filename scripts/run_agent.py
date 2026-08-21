@@ -45,6 +45,8 @@ from google.adk.sessions import InMemorySessionService           # noqa: E402
 from google.genai import types                                   # noqa: E402
 
 from dead_air.agent import root_agent                            # noqa: E402
+from dead_air.content_screen import screen_live_segment          # noqa: E402
+from dead_air.video_tools import inspect_frame                   # noqa: E402
 from dead_air.observability import reset_usage, usage_totals     # noqa: E402
 
 WEBHOOK = os.environ.get("DEADAIR_WEBHOOK", "http://localhost:9102")
@@ -60,13 +62,17 @@ APP_NAME = "dead_air"
 RUN_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_RUN_TIMEOUT", "900"))
 
 # Demo ceiling. 900s is the right BACKSTOP -- it exists to catch a genuine
-# stall -- but a 15-minute wait on camera is as fatal as an infinite one. Any
-# run that has not finished in five minutes is not going to save the take, so
-# the demo path fails fast and gets retried instead.
+# stall -- but a 15-minute wait on camera is as fatal as an infinite one.
 #
-# Measured for calibration: a real alert-path investigation completes in ~165s,
-# so 300s is roughly 2x headroom rather than an arbitrary round number.
-DEMO_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_DEMO_TIMEOUT", "300"))
+# CALIBRATED AGAINST THE PATH IT ACTUALLY GUARDS. The first value here was 300s,
+# derived from a ~165s ALERT-path run where Phase 2 is skipped. The demo runs
+# the SWEEP path, where Phase 2 always runs and all five phases execute: that
+# measures 543s, with scope alone taking 281s. A 300s ceiling would have
+# aborted a perfectly healthy demo run -- demo mode killing the demo.
+#
+# 900s sweep-path measured -> 750s gives ~40% headroom over the slowest observed
+# full run while still failing fast enough to retry a take.
+DEMO_TIMEOUT_SECONDS = float(os.environ.get("DEADAIR_DEMO_TIMEOUT", "750"))
 
 
 class AgentRunTimeout(RuntimeError):
@@ -228,10 +234,90 @@ def watch(poll_seconds, timeout=None, approval_mode="deny"):
         time.sleep(poll_seconds)
 
 
-def sweep(interval, region, timeout=None, approval_mode="deny"):
-    """The confidence monitor: proactive, on a timer, always inspects pixels."""
-    print(f"confidence monitor: sweeping {region} every {interval}s "
-          f"(vision always runs on this path)", flush=True)
+def sweep(interval, region, timeout=None, approval_mode="deny",
+          rendition="1080p"):
+    """The confidence monitor, as a three-stage cascade.
+
+        Stage 0  deterministic screen over the newest segment   ~1.3s, no model
+        Stage 1  vision, ONLY when Stage 0 says suspect         ~10s
+        Stage 2  the full five-phase pipeline, only on a confirmed finding
+
+    Detection is arithmetic, so it runs every tick and costs almost nothing.
+    Before this, every tick ran a full investigation, which meant a sweep
+    interval could not go below several minutes and "catches it in seconds" was
+    not true. Now the interval is bounded by a ~1.3s screen instead of a ~543s
+    pipeline.
+    """
+    print(f"confidence monitor: {region}/{rendition}, cascade tick every "
+          f"{interval}s\n  Stage 0 deterministic screen -> Stage 1 vision -> "
+          f"Stage 2 full pipeline", flush=True)
+    ticks = screens_suspect = escalated = 0
+    while True:
+        ticks += 1
+        t0 = time.monotonic()
+        screen = screen_live_segment(region, rendition)
+        dt = time.monotonic() - t0
+        m = screen.get("measurements", {})
+
+        if not screen.get("suspect"):
+            if screen.get("reason") == "error":
+                print(f"  tick {ticks}: screen error -- {screen.get('error')}",
+                      flush=True)
+            else:
+                print(f"  tick {ticks}: clear  (yavg={m.get('yavg_mean')} "
+                      f"in {dt:.2f}s)", flush=True)
+            time.sleep(interval)
+            continue
+
+        screens_suspect += 1
+        print(f"\n  tick {ticks}: STAGE 0 SUSPECT -- {screen['reason']} "
+              f"(yavg={m.get('yavg_mean')}, "
+              f"dark_frames={m.get('dark_frame_fraction')}) in {dt:.2f}s",
+              flush=True)
+
+        # Stage 1: vision confirms WHAT is wrong before waking five phases.
+        t1 = time.monotonic()
+        seen = inspect_frame(region, rendition)
+        v_dt = time.monotonic() - t1
+        verdict = seen.get("classification", "no_frame_available")
+        print(f"  tick {ticks}: STAGE 1 vision -> {verdict} "
+              f"(confidence {seen.get('confidence')}, timecode "
+              f"{seen.get('timecode_value')}) in {v_dt:.1f}s", flush=True)
+
+        if verdict == "healthy":
+            print(f"  tick {ticks}: vision disagrees with the screen; not "
+                  f"escalating\n", flush=True)
+            time.sleep(interval)
+            continue
+
+        escalated += 1
+        print(f"  tick {ticks}: STAGE 2 escalating to the full pipeline "
+              f"(screens_suspect={screens_suspect}, escalated={escalated})\n",
+              flush=True)
+        state = {
+            "alert_name": "DEAD AIR / confidence sweep",
+            "alert_region": region,
+            "alert_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "alert_summary": (
+                f"Stage 0 screen flagged {screen['reason']} "
+                f"(yavg={m.get('yavg_mean')}); Stage 1 vision confirmed "
+                f"{verdict}."),
+            "alert_status": "sweep",
+            "trigger_kind": "sweep",
+            "approval_mode": approval_mode,
+            "stage0_screen": json.dumps(screen),
+        }
+        try:
+            final = asyncio.run(run_once(state, timeout=timeout))
+            show(final)
+        except Exception as e:
+            print(f"  sweep error: {type(e).__name__}: {e}", flush=True)
+        time.sleep(interval)
+
+
+def _legacy_sweep(interval, region, timeout=None, approval_mode="deny"):
+    """The pre-cascade sweep: a full investigation every tick. Kept for
+    comparison only -- it is what made detection latency minutes."""
     while True:
         state = {
             "alert_name": "DEAD AIR / scheduled confidence sweep",
@@ -261,8 +347,10 @@ def main():
     ap.add_argument("--poll", type=int, default=15)
     ap.add_argument("--sweep", action="store_true",
                     help="proactive confidence monitor: run on a timer")
-    ap.add_argument("--interval", type=int, default=300,
-                    help="seconds between sweeps")
+    ap.add_argument("--interval", type=int, default=30,
+                    help="seconds between cascade ticks. Stage 0 costs ~1.3s, "
+                         "so this can be small -- it no longer gates a full "
+                         "investigation")
     ap.add_argument("--json", help="write final session state here")
     ap.add_argument("--timeout", type=float, default=None,
                     help=f"hard ceiling per run in seconds "
