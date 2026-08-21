@@ -18,7 +18,120 @@ Step 1 was executed early, deliberately, because it was the only part of the
 build with no evidence behind it. It returned three findings that would each
 have cost a day if met during the Aug 29–Sep 4 window.
 
-Steps 2–5 remain unbuilt.
+Steps 3–5 remain unbuilt. **Step 2 is done and measured — see below.**
+
+---
+
+# Cloud step 2 — three Cloud Run edges, executed and torn down
+
+**Status: deployed, measured, and destroyed. Total spend ~$1.78 against a ~$2.01
+estimate. VM stopped, all three services deleted, firewall narrowed back.**
+
+Run with a **21-viewer** fleet (`CLIENTS_PER_REGION=7`), not the full 201,
+because of the cost finding below.
+
+## The cost finding, which changes how every later step gets budgeted
+
+The `$1.40/hour` projection covers **only the origin→edge leg**. It omits
+edge→viewer, which is **18x larger** and, whenever the fleet is outside GCP, is
+billed as Cloud Run **internet** egress at $0.12/GB:
+
+| fleet | edge→viewer | internet $ | origin $ | compute $ | **total/hr** |
+| --- | --- | --- | --- | --- | --- |
+| 201 | 211.6 GB | 25.39 | 0.65 | 0.10 | **$26.14** |
+| 60 | 63.2 GB | 7.58 | 0.19 | 0.10 | $7.87 |
+| 30 | 31.6 GB | 3.79 | 0.10 | 0.10 | $3.98 |
+| **21** | **21.1 GB** | **2.53** | **0.06** | **0.10** | **$2.69** |
+
+At full fleet the remaining ~$83 of credit is **about three hours**.
+
+## Did the cache fix survive the WAN? Yes — but not by the metric you'd reach for
+
+**Hit ratio is not comparable across fleet sizes.** With N viewers per region
+pulling the same segment it is 1 miss + (N-1) hits, so the ceiling is (N-1)/N:
+85.7% at 7/region, 98.5% at 67/region. The measured 68.6–77.9% therefore cannot
+be compared against the local 95.5–97.2%, and any claim that "the hit ratio holds
+at 21 viewers so it holds at 201" is wrong on its face.
+
+**Fetches per distinct object is the fleet-independent metric** — perfect
+single-flight is 1.0, and anything above it is TTL expiry plus manifest refetch:
+
+| | fetches | distinct | **per object** |
+| --- | --- | --- | --- |
+| us-east1 | 421 | 129 | **3.26** |
+| europe-west1 | 498 | 195 | **2.55** |
+| asia-south1 | 289 | 118 | **2.44** |
+| **local baseline, 201 viewers** | | | **2.42** |
+
+Cloud 2.44–3.26 against local 2.42. **Coalescing survives the WAN**, which is
+what the step was for. Zero cache evictions in every region.
+
+## Cold starts: measured, and not a problem
+
+A cold start looks exactly like `edge_latency` to the fleet, so it was measured
+rather than assumed. With `--min-instances=1`, first-request TTFB against steady
+state:
+
+| region | first | p50 | p95 | verdict |
+| --- | --- | --- | --- | --- |
+| us-east1 | 0.250s | 0.135s | 0.211s | warm |
+| europe-west1 | 0.442s | 0.210s | 0.415s | warm |
+| asia-south1 | 1.352s | 0.654s | 1.165s | warm |
+
+`--max-instances=1` is equally deliberate: the edge cache is in-memory and
+per-instance, so autoscaling would fetch each segment once *per instance* and
+depress the hit ratio for reasons unrelated to the fix under test.
+
+## Finding 4 — the hybrid topology is not a faithful plant
+
+This is the one that matters for planning. With viewers on the laptop and edges
+in the cloud, **two signals are permanently wrong**, and both look like faults:
+
+1. **Every region exceeds the TTFB threshold.** `TTFB_ELEVATED_SECONDS = 0.100`
+   (`signatures.py:52`). Measured p95 at the edges: **0.5s / 1.0s / 2.5s** — 5x,
+   10x and 25x over. `_ttfb_elevated_regions` would return all three, which
+   breaks `edge_latency`'s required "confined to exactly one region" check, so
+   `edge_latency` could never match.
+
+2. **asia-south1 is pinned to the bottom rung.** `viewer_bitrate_avg` reads
+   **800 kbps** for every device class there, against 5 Mbps in us-east1 and
+   europe-west1. WAN RTT from a US laptop means ABR cannot sustain anything
+   above 360p. That is the network, not the plant — but it is indistinguishable
+   from a real regional degradation.
+
+This is the same shape as step 1's finding 3 (a remote origin put the plant
+above its own alert threshold), and it means **regional numbers are meaningless
+until the viewer fleet moves into GCP**. Step 3 is not optional polish; it is a
+correctness prerequisite for any regional fault demo.
+
+## Three defects this step exposed in our own code
+
+1. **`cloud_origin.sh` still defaulted to `e2-medium`.** Step 1 measured that
+   e2-medium cannot hold the ladder and wrote it down *here* — but never in the
+   default. The VM came back up shared-core and served at 25.1 fps. Fixed to
+   `e2-standard-2`. On the resize it held ~26.9 fps idle, still under the 30 fps
+   source and a little under the 28.7 this doc recorded.
+2. **`EDGES` was hardcoded in `docker-compose.yml`** for both `viewers` and
+   `loadgen`, immediately below an overridable `CLIENTS_PER_REGION`. Pointing
+   the fleet at the cloud edges silently did nothing — the fleet kept pulling
+   from the local docker edges while the Cloud Run services sat at 5 origin
+   fetches and 1 distinct object. **A null measurement that looks like a working
+   one.** This doc's claim that region is "configuration, not code" was false
+   for that file. Now `${EDGES:-...}`.
+3. **The firewall blocked Cloud Run.** Step 1 scoped `deadair-allow-origin` to
+   the operator's `/32`; Cloud Run egresses from Google's dynamic ranges, so all
+   three edges deployed clean, started clean, and 502'd on every request. A VPC
+   connector plus Cloud NAT is the right permanent fix (~$0.044/hr); for a
+   45-minute measurement the rule is widened by `cloud_edges.sh up` and narrowed
+   by `down`, paired so nobody has to remember.
+
+## What step 2 did NOT establish
+
+* Nothing about behaviour at 201 viewers. Origin egress measured **0.94–1.12
+  GB/hr**, far below the 13.9 GB/hr full-ladder floor, because at 7 viewers per
+  region only a couple of rungs are ever requested. It does **not** extrapolate.
+* Nothing about regional fault detection, per finding 4.
+* No agent run was performed against the cloud topology.
 
 ## What has to happen, and in what order
 
