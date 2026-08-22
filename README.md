@@ -2,18 +2,24 @@
 
 **An autonomous broadcast operations agent for live video streaming.**
 
-> ⚠️ **Work in progress.** An active build for the Google Cloud "Agentic Cinema"
-> hackathon (Grafana track, due 7 Sep 2026).
+> An active build for the Google Cloud "Agentic Cinema" hackathon (Grafana
+> track, due 7 Sep 2026).
 >
-> **Working today, locally:** the full streaming plant (encoder → 3 regional
-> edges → 201-session viewer fleet), all five of the brief's fault modes, all
-> three observability signals (Mimir · Loki · Tempo), and Phases 1–3 of the
-> agent — scope, see, diagnose.
+> **Working end to end, locally:** the full streaming plant (encoder → 3
+> regional edges → 201-session viewer fleet), all five of the brief's fault
+> modes, all three observability signals (Mimir · Loki · Tempo), and **all five
+> agent phases** — scope, see, diagnose, human-gated act, and record with
+> verified recovery.
 >
-> **Not built:** Phases 4–5 (human-gated remediation, recovery verification,
-> dashboard annotation) and cloud deployment. Nothing has been deployed and no
-> credits have been spent; see
-> [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md).
+> **Measured:** 6/6 correct across all five faults plus a healthy control,
+> through the complete five-phase agent. 69/69 on the content screen's
+> calibration corpus, 100% detection and 0% false positives. Black frame on air
+> to classified fault in ~25s.
+>
+> **Cloud:** steps 1 and 2 executed and measured, then torn down —
+> [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md). The viewer
+> fleet has not yet moved into GCP, which that document explains is a
+> correctness prerequisite for any regional fault demo, not polish.
 
 ## The thesis: every dashboard is green and the screen is black
 
@@ -46,24 +52,30 @@ agent powered by Gemini:
 5. **Re-queries to verify recovery**, then **annotates the Grafana dashboard**
    with a postmortem.
 
-## Planned architecture
+## Architecture
+
+The whole system — plant layers, both triggers, the three-stage cascade, the
+five phases and the reflexive loop — is one diagram in
+**[docs/architecture.md](docs/architecture.md)**, along with the list of what is
+decided by code rather than by the model.
+
+The short version:
 
 ```
-  encoder  ──▶  CDN edges  ──▶  viewer fleet
-     │              │               │
-     └──────────────┴───────────────┘
-                    │  metrics · logs · traces
-                    ▼
-             Grafana Cloud
-                    │
-                    ▼
-      grafana/mcp-grafana  (self-hosted, Docker)
-                    │  MCP (streamable HTTP)
-                    ▼
-              ADK agent  ──▶  Gemini vision on delivered segments
-                    │
-                    └──▶  human-gated remediation  ──▶  dashboard annotation
+  L1 encoder ──▶ L2 edges ──▶ L3 viewer fleet
+                     │  metrics · logs · traces (Alloy, cardinality-guarded)
+                     ▼
+              Grafana Cloud ──▶ alert ──┐
+                                        ├──▶  five-phase ADK agent
+  confidence sweep ──▶ Stage 0 screen ──┘      scope · see · diagnose
+   (every 30s)         ~1.3s, no model         act (human-gated) · record
+                            │
+                            └─▶ Stage 1 vision, only when Stage 0 says suspect
 ```
+
+Two triggers, because the fault this project is named after **fires no alert**:
+under `black_source`, `rebuffer_ratio` reads ~0.0001 against a 0.02 threshold.
+An alert-driven agent sleeps through it.
 
 ## Tech stack
 
