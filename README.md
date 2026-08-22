@@ -14,7 +14,10 @@
 > **Measured:** 6/6 correct across all five faults plus a healthy control,
 > through the complete five-phase agent. 69/69 on the content screen's
 > calibration corpus, 100% detection and 0% false positives. Black frame on air
-> to classified fault in ~25s.
+> to a classified fault in **~18s** at a 10-second sweep; full closure with
+> verified recovery in 3.1–4.4 minutes. The delivery-telemetry baseline for that
+> fault is not slower — it is **never**: no threshold is crossed, so no alert
+> can fire.
 >
 > **Cloud:** steps 1 and 2 executed and measured, then torn down —
 > [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md). The viewer
