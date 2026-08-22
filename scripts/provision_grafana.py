@@ -123,6 +123,43 @@ CANARY_PANEL_IDS = [1, 2, 3]
 # 40 sits in a 100-unit empty gap -- see docs/content-screen.md.
 CONTENT_LUMA_THRESHOLD = 40
 
+# How old the newest Stage 0 sample may be before the content panels stop
+# claiming to know anything.
+#
+# WHY THIS EXISTS. Prometheus keeps serving a series' last value for ~5 minutes
+# after samples stop. The content metrics are PUSHED by the agent's Stage 0
+# screen, so when the sweep is not running there are no samples -- and for those
+# five minutes `max(deadair_content_suspect)` keeps returning the last value.
+# Measured: 72 seconds after the final sample, with nothing watching at all, the
+# naive query still returned 0 and the panel still rendered a green "PICTURE
+# OK". The one panel carrying the entire thesis would sit there reassuring the
+# operator over a black stream, for the same reason the rest of the dashboard
+# does. A dashboard that lies toward "fine" is the exact failure this project
+# exists to attack, so it must not be committed by our own panel.
+#
+# 90s is three missed ticks at the demo's `INTERVAL=30`. It is deliberately
+# coupled to the sweep interval: run the sweep slower than ~45s and the panels
+# will correctly, and permanently, report NOT WATCHING.
+CONTENT_STALE_AFTER_SECONDS = 90
+
+# Absence must be representable, so it gets its own value rather than being
+# folded into 0 (healthy) or dropped (Grafana renders empty as "No data", which
+# a stat panel still paints with the BASE threshold colour -- green).
+CONTENT_UNKNOWN = -1
+
+
+def _fresh(expr, metric):
+    """Wrap an instant expression so a stale series reports UNKNOWN, not health.
+
+    `unless` drops the reading when the newest sample is older than the
+    staleness budget; the `or vector()` then supplies the sentinel, which also
+    covers the case where the series has aged out of Prometheus entirely and
+    the left-hand side is empty.
+    """
+    return (f"({expr} unless on() "
+            f"(time() - max(timestamp({metric})) > {CONTENT_STALE_AFTER_SECONDS}))"
+            f" or on() vector({CONTENT_UNKNOWN})")
+
 
 def apply_layout(panels):
     """Position panels and fold the canary into a collapsed row.
@@ -192,8 +229,17 @@ def dashboard_model():
                 ),
                 "gridPos": {"h": 9, "w": 12, "x": 0, "y": 1},
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
-                "targets": [target("deadair_content_luma_avg",
-                                   "{{region}} / {{rendition}}")],
+                # Gated the same way as the verdict stat. Without this the line
+                # simply continues flat at its last value for Prometheus's ~5
+                # minute staleness window after the sweep stops, which reads as
+                # "still 125, still fine" rather than "nobody is measuring".
+                # Gated, it breaks into a visible gap instead (spanNulls is
+                # false below, so the gap is drawn as a gap).
+                "targets": [target(
+                    "deadair_content_luma_avg unless on() "
+                    "(time() - max(timestamp(deadair_content_luma_avg)) > "
+                    f"{CONTENT_STALE_AFTER_SECONDS})",
+                    "{{region}} / {{rendition}}")],
                 "fieldConfig": {
                     "defaults": {
                         "custom": {"lineWidth": 3, "fillOpacity": 10,
@@ -227,24 +273,34 @@ def dashboard_model():
                 ),
                 "gridPos": {"h": 9, "w": 6, "x": 12, "y": 1},
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
-                "targets": [target("max(deadair_content_suspect)", "content")],
+                "targets": [target(
+                    _fresh("max(deadair_content_suspect)",
+                           "deadair_content_suspect"), "content")],
                 "fieldConfig": {
                     "defaults": {
                         "color": {"mode": "thresholds"},
                         "mappings": [{
                             "type": "value",
                             "options": {
-                                "0": {"text": "PICTURE OK", "index": 0},
-                                "1": {"text": "DEAD AIR", "index": 1},
+                                "-1": {"text": "NOT WATCHING", "index": 0},
+                                "0": {"text": "PICTURE OK", "index": 1},
+                                "1": {"text": "DEAD AIR", "index": 2},
                             },
                         }],
+                        # The BASE step is the one that matters. Grafana paints
+                        # anything below the first threshold -- including the
+                        # UNKNOWN sentinel and a "No data" cell -- with this
+                        # colour, so it must never be green. Green starts at 0
+                        # and is reachable only by a fresh, measured zero.
                         "thresholds": {
                             "mode": "absolute",
                             "steps": [
-                                {"color": "green", "value": None},
+                                {"color": "orange", "value": None},
+                                {"color": "green", "value": 0},
                                 {"color": "red", "value": 1},
                             ],
                         },
+                        "noValue": "NOT WATCHING",
                     },
                     "overrides": [],
                 },

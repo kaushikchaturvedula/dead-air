@@ -81,12 +81,43 @@ _client = None
 
 
 def _genai_client():
+    """The vision client, with the SAME timeout and retry as the agent's model.
+
+    THIS IS THE SECOND CLIENT. model.py fixed an infinite hang for the
+    ADK-managed one after a single generate_content call stalled for 889
+    SECONDS and took a whole investigation down with it -- and that fix never
+    reached here, because this client is constructed directly rather than
+    through ADK.
+
+    google-genai does NOT default to a sane timeout. It explicitly replaces
+    httpx's 5s default with infinity (`_api_client.py`: `if 'timeout' not in
+    args: args['timeout'] = None`), and with retry_options unset it stops after
+    a single attempt. So a half-open connection -- venue Wi-Fi handing over, a
+    load balancer reaping an idle socket -- makes inspect_frame never return.
+
+    In the sweep that is the worst possible presentation: the last line on
+    screen is `STAGE 0 SUSPECT -- black (yavg=17.1)` followed by silence, so
+    the system looks like it died at the exact instant it correctly caught the
+    fault it exists to catch.
+
+    RETRY and REQUEST_TIMEOUT_MS are imported rather than re-declared so the
+    two clients cannot drift apart again. Retry matters here for a second
+    reason: without it a single 429 becomes `classification:
+    "no_frame_available"`, which is the same value returned when the rendition
+    genuinely does not exist -- a rate limit presenting as an observation about
+    the plant.
+    """
     global _client
     if _client is None:
+        from .model import RETRY, REQUEST_TIMEOUT_MS
         _client = genai.Client(
             vertexai=True,
             project=os.environ["GOOGLE_CLOUD_PROJECT"],
             location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+            http_options=types.HttpOptions(
+                retry_options=RETRY,
+                timeout=REQUEST_TIMEOUT_MS,
+            ),
         )
     return _client
 
