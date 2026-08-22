@@ -48,6 +48,16 @@ services:
     ports:
       # Exposed so `make set VALUE=n` can drive it from the host.
       - "127.0.0.1:9101:9101"
+    # Alloy gates on this one being healthy, so it needs a real check rather
+    # than none -- `condition: service_healthy` against a service with no
+    # healthcheck never becomes satisfiable.
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:9101/metrics',timeout=4).status==200 else 1)"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 3s
     restart: unless-stopped
 
   # --- L1: source + encoder (brief §5) ---------------------------------------
@@ -65,6 +75,17 @@ services:
       - hls-data:/data/hls
     ports:
       - "127.0.0.1:9103:9103"
+    # Ready means PRODUCING THE LADDER, not "the process started". Everything
+    # downstream races against segments existing, so up-ness is the wrong
+    # signal: the origin can serve a 404 for a rung the encoder has not written
+    # yet, and Phase 3 reads a failed manifest fetch as evidence.
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;m=urllib.request.urlopen('http://localhost:9103/metrics',timeout=4).read().decode();sys.exit(0 if 'encoder_rungs_active 4' in m else 1)"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 10s
     restart: unless-stopped
 
   # --- L1: HLS origin --------------------------------------------------------
@@ -77,8 +98,15 @@ services:
       - nginx-logs:/var/log/deadair
     ports:
       - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-m", "4", "http://localhost:8080/hls/master.m3u8"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 5s
     depends_on:
-      - encoder
+      encoder:
+        condition: service_healthy
     restart: unless-stopped
 
   # --- L2: "CDN" edges (brief §5) --------------------------------------------
@@ -102,8 +130,16 @@ services:
       DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     ports:
       - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8080/hls/master.m3u8',timeout=4).status==200 else 1)"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 5s
     depends_on:
-      - origin
+      origin:
+        condition: service_healthy
     restart: unless-stopped
 
   edge-europe-west1:
@@ -120,8 +156,16 @@ services:
       DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     ports:
       - "127.0.0.1:8082:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8080/hls/master.m3u8',timeout=4).status==200 else 1)"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 5s
     depends_on:
-      - origin
+      origin:
+        condition: service_healthy
     restart: unless-stopped
 
   edge-asia-south1:
@@ -138,8 +182,16 @@ services:
       DEADAIR_ENV: "${DEADAIR_ENV:-local}"
     ports:
       - "127.0.0.1:8083:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8080/hls/master.m3u8',timeout=4).status==200 else 1)"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 5s
     depends_on:
-      - origin
+      origin:
+        condition: service_healthy
     restart: unless-stopped
 
   # --- L3: viewer fleet (brief §5) -------------------------------------------
@@ -177,9 +229,12 @@ services:
     ports:
       - "127.0.0.1:9104:9104"
     depends_on:
-      - edge-us-east1
-      - edge-europe-west1
-      - edge-asia-south1
+      edge-us-east1:
+        condition: service_healthy
+      edge-europe-west1:
+        condition: service_healthy
+      edge-asia-south1:
+        condition: service_healthy
     restart: unless-stopped
 
   # Superseded by the viewer fleet, which generates realistic traffic as a side
@@ -201,9 +256,12 @@ services:
       EDGES: "${EDGES:-us-east1=http://edge-us-east1:8080,europe-west1=http://edge-europe-west1:8080,asia-south1=http://edge-asia-south1:8080}"
       CLIENTS_PER_EDGE: "${CLIENTS_PER_EDGE:-3}"
     depends_on:
-      - edge-us-east1
-      - edge-europe-west1
-      - edge-asia-south1
+      edge-us-east1:
+        condition: service_healthy
+      edge-europe-west1:
+        condition: service_healthy
+      edge-asia-south1:
+        condition: service_healthy
     restart: unless-stopped
 
   # --- Step 1b: collector -> Grafana Cloud Mimir + Loki -----------------------
@@ -235,9 +293,12 @@ services:
       # OTLP/HTTP receiver for plant traces.
       - "127.0.0.1:4318:4318"
     depends_on:
-      - emitter
-      - encoder
-      - origin
+      emitter:
+        condition: service_healthy
+      encoder:
+        condition: service_healthy
+      origin:
+        condition: service_healthy
     restart: unless-stopped
 
   # --- Step 1d: local alert webhook receiver ---------------------------------

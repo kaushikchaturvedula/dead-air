@@ -17,6 +17,7 @@ incident because it did something is worse than one that does nothing, because
 now nobody is looking.
 """
 
+import datetime
 import json
 import os
 import subprocess
@@ -151,6 +152,14 @@ def propose_remediation(fault: str, region: str) -> dict:
         "command": spec["command"],
         "blast_radius": spec["blast_radius"],
         "reversible": spec["reversible"],
+        # Derived from the same CONTENT/DELIVERY table that routes Phase 5, so
+        # the proposal's declared SLO and the check actually performed cannot
+        # disagree. This field used to be produced by the model and read by
+        # NOTHING -- one grep hit, its own declaration in schemas.py -- while
+        # sitting under a docstring arguing it must not be a model decision.
+        "slo_to_verify": ("visual_frame_check" if fault in CONTENT_FAULTS
+                          else "rebuffer_ratio" if fault in DELIVERY_FAULTS
+                          else "both"),
         "requires_human_approval": True,
         "approval_status": "pending",
         "note": ("This is a proposal. Nothing has been executed. Execution "
@@ -244,8 +253,31 @@ def verify_recovery(region: str, wait_seconds: int = 60) -> dict:
 
     scope = REGIONS if region in ("all", "", None) else [region]
     checked = {r: round(values.get(r, 0.0), 4) for r in scope if r in values}
+    # A region we asked about and did not get back is UNMEASURED, not recovered.
+    # The `if r in values` filter silently dropped those, `breaching` derived
+    # from what survived, and `recovered = not breaching` then reported success
+    # for regions never looked at -- so passing a region string that is not an
+    # exact label value (`all_regions`, `plant_wide`, or the literal "encoder"
+    # that four of the five remediations carry as their target) produced
+    # `recovered: true, values_by_region: {}` and a closed incident.
+    unmeasured = [r for r in scope if r not in values]
     breaching = {r: v for r, v in checked.items()
                  if v > REBUFFER_ALERT_THRESHOLD}
+    if unmeasured:
+        return {
+            "slo_name": "rebuffer_ratio",
+            "slo_threshold": REBUFFER_ALERT_THRESHOLD,
+            "waited_seconds": wait_seconds,
+            "values_by_region": checked,
+            "all_regions": {k: round(v, 4) for k, v in values.items()},
+            "breaching_regions": breaching,
+            "unmeasured_regions": unmeasured,
+            "recovered": False,
+            "error": (f"no rebuffer_ratio returned for {unmeasured}; asked for "
+                      f"{scope!r}. Known region labels are {REGIONS}."),
+            "note": ("recovered=false because these regions were NOT measured. "
+                     "Unmeasured is not recovered."),
+        }
     return {
         "slo_name": "rebuffer_ratio",
         "slo_threshold": REBUFFER_ALERT_THRESHOLD,
@@ -325,8 +357,81 @@ def verify_visual_recovery(region: str, rendition: str = "1080p",
     }
 
 
+def verify_recovery_for_diagnosis(tool_context=None) -> dict:
+    """Verify recovery using the check the DIAGNOSED FAULT CLASS requires.
+
+    THE ROUTING IS DONE HERE, IN CODE, AND TAKES NO ARGUMENTS. It used to be a
+    prose table in the Phase 5 prompt ending in "if unsure, call BOTH", with
+    both verifiers on the model's tool list and nothing preventing the wrong
+    pick. `slo_to_verify` existed in the schema to record the choice and had
+    exactly one reference in the repo -- its own declaration -- under a
+    docstring arguing that this must not be a model decision.
+
+    What the misroute costs: black_source never moves rebuffer_ratio, which
+    reads ~0.0001 against a 0.02 threshold for the entire blackout. So routing
+    a content fault to the delivery check returns recovered=True and closes the
+    incident while the stream is still black -- the system failing at precisely
+    its own thesis, in a run that otherwise looks clean. Most acute in the
+    default configuration, where approval_mode is `deny` and the plant really
+    is still broken at verification time.
+
+    Args:
+        tool_context: injected by ADK; supplies the diagnosis and the region.
+
+    Returns:
+        The verification result, plus which check was used and why.
+    """
+    fault = _diagnosed_fault(tool_context)
+    regions = _affected_regions_from_state(tool_context)
+    region = regions[0] if regions else "us-east1"
+
+    if fault in CONTENT_FAULTS:
+        out = verify_visual_recovery(region=region)
+        chosen, why = "visual_frame_check", (
+            f"{fault} is a CONTENT fault: it never moved rebuffer_ratio, so a "
+            f"delivery SLO cannot show whether it is repaired.")
+    elif fault in DELIVERY_FAULTS:
+        out = verify_recovery(region="all", wait_seconds=60)
+        chosen, why = "rebuffer_ratio", (
+            f"{fault} is a DELIVERY fault: it moved rebuffer_ratio, which is "
+            f"the SLO the alert fires on.")
+    else:
+        # Unknown or undiagnosed: run BOTH and require both. Chosen in code, so
+        # it cannot be talked out of.
+        #
+        # no_fault_detected lands here too, and the settle wait is skipped for
+        # it: there is no remediation to settle FROM, so waiting 60s only
+        # confirms what was already true. Measured cost of not special-casing
+        # it: the healthy case ran 284.9s against 142.0s before this dispatcher
+        # existed, and the healthy path is the one a demo sits on longest.
+        healthy_verdict = fault == "no_fault_detected"
+        wait = 0 if healthy_verdict else 60
+        vis = verify_visual_recovery(region=region,
+                                     wait_seconds=0 if healthy_verdict else 30)
+        dele = verify_recovery(region="all", wait_seconds=wait)
+        return {
+            "slo_to_verify": "both",
+            "why_this_check": (
+                "no fault was diagnosed, so both checks run to confirm the "
+                "plant really is healthy -- with no settle wait, because there "
+                "was no action to settle from."
+                if healthy_verdict else
+                f"fault {fault!r} is not in either class, so neither check "
+                f"alone is sufficient."),
+            "routed_in_code": True,
+            "visual": vis, "delivery": dele,
+            "recovered": bool(vis.get("recovered")) and bool(dele.get("recovered")),
+        }
+
+    out["slo_to_verify"] = chosen
+    out["why_this_check"] = why
+    out["diagnosed_fault"] = fault
+    out["routed_in_code"] = True
+    return out
+
+
 def annotate_dashboard(text: str, region: str, fault: str,
-                       started_at_epoch: int = 0) -> dict:
+                       tool_context=None) -> dict:
     """Annotate the Grafana dashboard at the incident's timestamp.
 
     The annotation is placed at when the incident STARTED, not when the agent
@@ -337,11 +442,16 @@ def annotate_dashboard(text: str, region: str, fault: str,
         text: annotation body, markdown allowed.
         region: affected region, becomes a tag.
         fault: diagnosed fault, becomes a tag.
-        started_at_epoch: incident start, epoch SECONDS. 0 means one hour ago.
+        tool_context: injected by ADK; supplies the real incident start.
 
     Returns:
         dict with the created annotation id.
     """
+    # Derived, not passed. The model was previously asked for started_at_epoch
+    # and cannot know it; a wrong-era value drew a multi-year band across the
+    # dashboard, and the prompt asked for the guess two lines after saying "an
+    # annotation in the wrong place is worse than none".
+    started_at_epoch = _incident_started_epoch(tool_context)
     now_ms = int(time.time() * 1000)
     start_ms = int(started_at_epoch * 1000) if started_at_epoch else now_ms - 3600_000
     if start_ms > now_ms:
@@ -363,8 +473,7 @@ def annotate_dashboard(text: str, region: str, fault: str,
 
 
 def record_incident(title: str, summary: str, severity: str = "minor",
-                    status: str = "resolved",
-                    started_at_epoch: int = 0) -> dict:
+                    status: str = "resolved", tool_context=None) -> dict:
     """File or update an incident record for this event.
 
     Tries Grafana IRM first. IRM is not enabled on every stack, and a missing
@@ -377,12 +486,14 @@ def record_incident(title: str, summary: str, severity: str = "minor",
         summary: what happened and what was done.
         severity: minor | major | critical.
         status: active | resolved.
-        started_at_epoch: incident start in epoch SECONDS, so the fallback
-            annotation lands at the incident rather than an hour ago.
+        tool_context: injected by ADK; supplies the real incident start so the
+            fallback annotation lands at the incident rather than at a guessed
+            timestamp.
 
     Returns:
         dict describing where the record was written.
     """
+    started_at_epoch = _incident_started_epoch(tool_context)
     try:
         res = _grafana("POST",
                        "/api/plugins/grafana-irm-app/resources/api/v1/incidents",
@@ -399,7 +510,7 @@ def record_incident(title: str, summary: str, severity: str = "minor",
 
     fallback = annotate_dashboard(
         f"**INCIDENT** {title}\n\n{summary}", region="all", fault="incident",
-        started_at_epoch=started_at_epoch)
+        tool_context=tool_context)
     return {
         "backend": "annotation-fallback",
         "created": bool(fallback.get("created")),
@@ -409,6 +520,63 @@ def record_incident(title: str, summary: str, severity: str = "minor",
                 "dashboard annotation instead. This is stated rather than "
                 "hidden so the incident trail is not silently lost.",
     }
+
+
+def _diagnosed_fault(tool_context):
+    """The fault the CHECKLIST decided, read from state. Never an argument."""
+    if tool_context is None:
+        return ""
+    raw = tool_context.state.get("diagnosis")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+    if isinstance(raw, dict):
+        # deterministic_verdict is the authoritative one; `fault` may have been
+        # deliberately set differently with a stated disagreement.
+        return (raw.get("deterministic_verdict") or raw.get("fault") or "")
+    return ""
+
+
+def _incident_started_epoch(tool_context):
+    """When the incident began, in epoch seconds, derived from the alert.
+
+    THE MODEL USED TO SUPPLY THIS. It cannot know it: record_investigator
+    templates only the diagnosis, the proposal and the execution result, and
+    none of them carry a timestamp -- so any value it produced was invented.
+    A wrong-era epoch (1.7e9 is a very common completion) drew a MULTI-YEAR
+    annotation band across the dashboard, and a wrong duration scaled
+    viewer_minutes_lost linearly with the guess: a ten-minute blackout guessed
+    as sixty seconds reported 201 viewer-minutes instead of 2010, under a
+    docstring advertising the arithmetic as code-derived.
+
+    `alert_time` is put into state by run_agent.py on every trigger path, so
+    the real value was one state read away the whole time.
+    """
+    if tool_context is None:
+        return 0
+    raw = tool_context.state.get("alert_time") or ""
+    if not isinstance(raw, str) or not raw:
+        return 0
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.datetime.strptime(raw, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
+def _incident_duration_seconds(tool_context):
+    """How long the incident has been open, measured rather than guessed."""
+    started = _incident_started_epoch(tool_context)
+    if not started:
+        return 0.0
+    return max(0.0, time.time() - started)
 
 
 def _affected_regions_from_state(tool_context):
@@ -438,8 +606,7 @@ def _peak_rebuffer(regions):
     return max(vals.values()) if vals else 0.0
 
 
-def estimate_viewer_impact(fault_id: str, duration_seconds: float,
-                           tool_context=None) -> dict:
+def estimate_viewer_impact(fault_id: str, tool_context=None) -> dict:
     """Estimate viewer-minutes lost. Arithmetic is done in CODE.
 
     The model supplies only the fault. Everything else -- which regions were
@@ -459,12 +626,21 @@ def estimate_viewer_impact(fault_id: str, duration_seconds: float,
           queried here rather than recalled.
 
     Args:
-        fault_id: the diagnosed fault. The only input the model provides.
-        duration_seconds: detection to recovery.
+        fault_id: the diagnosed fault. The only input the model provides --
+            and now genuinely the only one. It previously also took
+            duration_seconds, which the model could not know and therefore
+            invented, and viewer_minutes_lost scaled linearly with that guess:
+            a ten-minute blackout guessed as sixty seconds reported 201
+            viewer-minutes instead of 2010, directly beneath a docstring
+            promising the arithmetic was done in code. Nothing rejected
+            duration_seconds=0 either, which produced viewer_minutes_lost=0.0
+            next to "every viewer lost the picture for the whole incident".
+        tool_context: injected by ADK; supplies the incident clock.
 
     Returns:
         dict with the estimate and the assumptions behind it.
     """
+    duration_seconds = _incident_duration_seconds(tool_context)
     regions = _affected_regions_from_state(tool_context)
     if fault_id in CONTENT_FAULTS:
         impact_ratio = 1.0

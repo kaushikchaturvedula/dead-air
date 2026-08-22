@@ -141,6 +141,36 @@ _NO_FRAME_EVIDENCE = {None, "", "no_frame_available"}
 _NO_RUNG_EVIDENCE = {None, "", "not_checked", "inconclusive"}
 
 
+# --- telemetry presence ----------------------------------------------------
+# The same discipline as _frame_evidence/_rung_evidence below, applied to
+# METRICS. It was only ever applied to visual evidence, and telemetry absence
+# went on being scored as an affirmative observation of health.
+#
+# `sources_reporting` is three-valued: True (exporter publishing), False
+# (queried fine, exporter has no series), None (the query itself failed). Only
+# True licenses reading an empty condition as "the condition is absent".
+
+def _source(ev, name):
+    return (ev.get("sources_reporting") or {}).get(name)
+
+
+def _if_seen(ev, source, verdict):
+    """`verdict()` if that exporter is reporting, otherwise not_evaluated.
+
+    Returning None routes the check to 'not_evaluated', which makes a signature
+    'unconfirmable' rather than confirmed or ruled out -- so missing telemetry
+    can never be the thing that decides a diagnosis.
+    """
+    return verdict() if _source(ev, source) is True else None
+
+
+def _ladder_known(ev):
+    """True only when the master manifest was actually fetched."""
+    if ev.get("manifest_fetched") is False:
+        return None
+    return ev.get("manifest_rungs") is not None or ev.get("missing_rungs") is not None
+
+
 def _visual(ev, key):
     v = ev.get("visual") or {}
     return v.get(key)
@@ -180,10 +210,13 @@ SIGNATURES = [
                   lambda ev: 0 < len(_bitrate_degraded_regions(ev)) <
                              len(ev.get("regions_seen") or [1, 2, 3])),
             Check("no sustained 4xx anywhere",
-                  lambda ev: ev.get("fourxx_status") in ("none", "stopped")),
+                  lambda ev: _if_seen(ev, "edges",
+                      lambda: ev.get("fourxx_status") in ("none", "stopped"))),
             Check("encoder healthy and producing the full ladder",
-                  lambda ev: bool(ev.get("encoder_up")) and
-                             ev.get("rungs_active", 0) >= 4),
+                  lambda ev: (None if ev.get("encoder_up") is None
+                              or ev.get("rungs_active") is None
+                              else bool(ev.get("encoder_up"))
+                              and ev.get("rungs_active", 0) >= 4)),
         ],
     ),
     Signature(
@@ -191,7 +224,8 @@ SIGNATURES = [
         diagnosis="packager fault -- segments missing at the origin",
         checks=[
             Check("4xx are ONGOING, not a burst that stopped",
-                  lambda ev: ev.get("fourxx_status") == "ongoing",
+                  lambda ev: _if_seen(ev, "edges",
+                      lambda: ev.get("fourxx_status") == "ongoing"),
                   required=True),
             Check("4xx present in more than one region (origin-side, not one edge)",
                   lambda ev: len(ev.get("fourxx_regions") or []) > 1,
@@ -199,10 +233,13 @@ SIGNATURES = [
             Check("delivered bitrate broadly unchanged",
                   lambda ev: len(_bitrate_degraded_regions(ev)) == 0),
             Check("encoder healthy and producing the full ladder",
-                  lambda ev: bool(ev.get("encoder_up")) and
-                             ev.get("rungs_active", 0) >= 4),
+                  lambda ev: (None if ev.get("encoder_up") is None
+                              or ev.get("rungs_active") is None
+                              else bool(ev.get("encoder_up"))
+                              and ev.get("rungs_active", 0) >= 4)),
             Check("master manifest still advertises the full ladder",
-                  lambda ev: not (ev.get("missing_rungs") or [])),
+                  lambda ev: (None if not _ladder_known(ev)
+                              else not (ev.get("missing_rungs") or []))),
         ],
     ),
     Signature(
@@ -210,10 +247,12 @@ SIGNATURES = [
         diagnosis="encoder rung failure -- a rendition is no longer produced",
         checks=[
             Check("a rung is missing from the master manifest",
-                  lambda ev: bool(ev.get("missing_rungs")),
+                  lambda ev: (None if not _ladder_known(ev)
+                              else bool(ev.get("missing_rungs"))),
                   required=True),
             Check("4xx are NOT ongoing (any burst has stopped)",
-                  lambda ev: ev.get("fourxx_status") in ("none", "stopped"),
+                  lambda ev: _if_seen(ev, "edges",
+                      lambda: ev.get("fourxx_status") in ("none", "stopped")),
                   required=True),
             Check("delivered bitrate dropped across ALL regions",
                   lambda ev: len(_bitrate_degraded_regions(ev)) ==
@@ -225,7 +264,8 @@ SIGNATURES = [
                   lambda ev: any(v > LAG_STALE_SECONDS for v in
                                  (ev.get("segment_lag_by_rendition") or {}).values())),
             Check("encoder reports fewer active rungs than the full ladder",
-                  lambda ev: ev.get("rungs_active", 4) < 4),
+                  lambda ev: (None if ev.get("rungs_active") is None
+                              else ev.get("rungs_active") < 4)),
         ],
     ),
     Signature(
@@ -239,13 +279,22 @@ SIGNATURES = [
             Check("burned-in timecode still legible (encoder alive, source dead)",
                   lambda ev: (bool(_visual(ev, "timecode_legible"))
                               if _frame_evidence(ev) is not None else None)),
+            # Three absence claims in one predicate, so it needs BOTH
+            # exporters. This is a supporting check on black_source and
+            # ladder_mismatch -- the two content faults -- so it passing
+            # because the fleet is dead is exactly how a blind agent would
+            # corroborate the fault it is most confident about.
             Check("delivery metrics show no degradation at all",
-                  lambda ev: len(_rebuffering_regions(ev)) == 0
-                             and len(_bitrate_degraded_regions(ev)) == 0
-                             and ev.get("fourxx_status") == "none"),
+                  lambda ev: (None if _source(ev, "viewers") is not True
+                              or _source(ev, "edges") is not True
+                              else len(_rebuffering_regions(ev)) == 0
+                              and len(_bitrate_degraded_regions(ev)) == 0
+                              and ev.get("fourxx_status") == "none")),
             Check("encoder healthy and producing the full ladder",
-                  lambda ev: bool(ev.get("encoder_up")) and
-                             ev.get("rungs_active", 0) >= 4),
+                  lambda ev: (None if ev.get("encoder_up") is None
+                              or ev.get("rungs_active") is None
+                              else bool(ev.get("encoder_up"))
+                              and ev.get("rungs_active", 0) >= 4)),
         ],
     ),
     Signature(
@@ -261,12 +310,20 @@ SIGNATURES = [
             Check("frame itself looks healthy -- the fault is invisible to vision",
                   lambda ev: (_frame_evidence(ev) == "healthy"
                               if _frame_evidence(ev) is not None else None)),
+            # Three absence claims in one predicate, so it needs BOTH
+            # exporters. This is a supporting check on black_source and
+            # ladder_mismatch -- the two content faults -- so it passing
+            # because the fleet is dead is exactly how a blind agent would
+            # corroborate the fault it is most confident about.
             Check("delivery metrics show no degradation at all",
-                  lambda ev: len(_rebuffering_regions(ev)) == 0
-                             and len(_bitrate_degraded_regions(ev)) == 0
-                             and ev.get("fourxx_status") == "none"),
+                  lambda ev: (None if _source(ev, "viewers") is not True
+                              or _source(ev, "edges") is not True
+                              else len(_rebuffering_regions(ev)) == 0
+                              and len(_bitrate_degraded_regions(ev)) == 0
+                              and ev.get("fourxx_status") == "none")),
             Check("master manifest still advertises the full ladder",
-                  lambda ev: not (ev.get("missing_rungs") or [])),
+                  lambda ev: (None if not _ladder_known(ev)
+                              else not (ev.get("missing_rungs") or []))),
         ],
     ),
 ]
@@ -275,17 +332,34 @@ HEALTHY = Signature(
     fault="no_fault_detected",
     diagnosis="plant healthy -- no fault signature matches",
     checks=[
+        # EVERY ONE OF THESE IS AN ABSENCE CLAIM, so every one of them is gated
+        # on the exporter that would have shown the presence. Ungated, a dead
+        # viewer fleet made the first two pass on `{}`, a dead edge made the
+        # third pass via fourxx_status "none", and a failed manifest fetch made
+        # the fourth pass via `not (None or [])` -- four required checks
+        # confirming health from four different kinds of blindness.
         Check("no region rebuffering above the alert threshold",
-              lambda ev: len(_rebuffering_regions(ev)) == 0, required=True),
+              lambda ev: _if_seen(ev, "viewers",
+                                  lambda: len(_rebuffering_regions(ev)) == 0),
+              required=True),
         Check("no region with degraded delivered bitrate",
-              lambda ev: len(_bitrate_degraded_regions(ev)) == 0, required=True),
+              lambda ev: _if_seen(ev, "viewers",
+                                  lambda: len(_bitrate_degraded_regions(ev)) == 0),
+              required=True),
         Check("no 4xx activity",
-              lambda ev: ev.get("fourxx_status") == "none", required=True),
+              lambda ev: _if_seen(ev, "edges",
+                                  lambda: ev.get("fourxx_status") == "none"),
+              required=True),
         Check("full ladder advertised",
-              lambda ev: not (ev.get("missing_rungs") or []), required=True),
+              lambda ev: (None if not _ladder_known(ev)
+                          else not (ev.get("missing_rungs") or [])),
+              required=True),
         Check("encoder healthy",
-              lambda ev: bool(ev.get("encoder_up")) and
-                         ev.get("rungs_active", 0) >= 4, required=True),
+              lambda ev: (None if ev.get("encoder_up") is None
+                          or ev.get("rungs_active") is None
+                          else bool(ev.get("encoder_up"))
+                          and ev.get("rungs_active", 0) >= 4),
+              required=True),
         Check("frame inspection found no picture fault",
               lambda ev: (_frame_evidence(ev) == "healthy"
                           if _frame_evidence(ev) is not None else None)),

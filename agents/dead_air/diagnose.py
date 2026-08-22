@@ -116,6 +116,13 @@ Rules:
 - unconfirmable: faults whose required checks could not be evaluated. Keep these
   strictly separate from ruled_out -- conflating them is how an agent reports
   false certainty.
+- blind_spots and evidence_complete: copy VERBATIM from the tool's blind_spots
+  and evidence_complete. These say what the checklist could not see -- an
+  exporter publishing nothing, a query that failed, a manifest that would not
+  fetch. Never empty the list to make the output look cleaner, and never
+  describe a signal you could not read as healthy. If blind_spots is non-empty,
+  say so in diagnosis as well, because a reader who is not shown a gap will
+  assume there was none.
 - fourxx_status: copy from the evidence.
 - discriminator_note: whenever 404s were present at all, state explicitly
   whether they were ongoing or stopped and which fault that implicated. If no

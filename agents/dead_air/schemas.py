@@ -176,6 +176,24 @@ class Diagnosis(BaseModel):
                     "both were in play. Presence of 404s does not separate "
                     "them; persistence does.")
 
+    # A diagnosis has to be able to say what it could not see. Without this the
+    # output of a run where the viewer fleet was dead and half the queries
+    # failed is indistinguishable from a run where everything was measured and
+    # the plant was fine -- and the second reading is the one a reader defaults
+    # to. Copied from match_fault_signatures' blind_spots; never invented.
+    blind_spots: list[str] = Field(
+        default_factory=list,
+        description="Signals the checklist could NOT observe: exporters "
+                    "publishing nothing, failed queries, an unfetchable "
+                    "manifest. Copy from the tool's blind_spots verbatim. An "
+                    "empty list is a claim that everything was visible, so do "
+                    "not empty it to tidy the output.")
+    evidence_complete: bool = Field(
+        default=True,
+        description="False when blind_spots is non-empty. A verdict reached "
+                    "with blind spots is provisional regardless of its "
+                    "confidence.")
+
     blast_radius: Literal["single_region", "multi_region", "all_regions",
                           "plant_wide", "none", "unknown"] = "unknown"
     affected_regions: list[str] = Field(default_factory=list)

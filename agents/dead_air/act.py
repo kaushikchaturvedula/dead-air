@@ -23,8 +23,7 @@ from .act_tools import (
     execute_approved_remediation,
     propose_remediation,
     record_incident,
-    verify_recovery,
-    verify_visual_recovery,
+    verify_recovery_for_diagnosis,
 )
 from .model import build_model
 from .schemas import RecoveryRecord, RemediationProposal
@@ -162,49 +161,53 @@ APPROVAL / EXECUTION OUTCOME
 
 Work in this order:
 
-1. Choose the RIGHT recovery check for the fault. This matters more than
-   anything else in this phase:
+1. Call verify_recovery_for_diagnosis. It takes NO arguments.
 
-   - black_source or ladder_mismatch -> call verify_visual_recovery.
-     These faults NEVER moved rebuffer_ratio, so checking a delivery metric
-     after repairing one would report "recovered" against a stream that is
-     still black. Verifying a content fault with a delivery metric is this
-     system failing at its own thesis.
-   - edge_latency, segment_gap, ladder_collapse -> call verify_recovery with
-     wait_seconds=60. rebuffer_ratio is a sliding window, so measuring
-     immediately still reflects the incident rather than the repair.
-   - If unsure, call BOTH. Over-verifying costs a few seconds; under-verifying
-     closes an open incident.
+   You do not choose the recovery check and you cannot: the routing is done in
+   code from the diagnosed fault class, and the tool reports which check it
+   used in slo_to_verify and why in why_this_check. Copy both.
 
-   If the remediation was NOT executed (rejected, or a dry run), still run the
-   appropriate check so the record states the plant's actual condition.
+   This used to be your decision, described here as a routing table. It is not
+   any more, because the cost of getting it wrong is the whole thesis:
+   black_source never moves rebuffer_ratio, so verifying a content fault with
+   the delivery SLO returns "recovered" over a stream that is still black.
+   That is not a judgement call worth leaving to prose.
+
+   It runs whether or not the remediation was executed, so the record states
+   the plant's actual condition rather than an assumed one.
 
 2. Read the result honestly. recovered=false means the incident STAYS OPEN.
    Do not close it, do not describe the action as successful, and do not
    attribute recovery to an action that did not produce it. If it is still
-   breaching, call verify_recovery ONCE more before concluding -- recovery can
-   lag -- and then report what you found.
+   breaching, call verify_recovery_for_diagnosis ONCE more before concluding --
+   recovery can lag -- and then report what you found.
 
-3. Call estimate_viewer_impact with the diagnosed fault_id and the incident
-   duration in seconds. That is all it takes -- the affected region list and the
-   impact ratio are derived in code from the diagnosis, deliberately, because
-   the impact ratio is the number a model most reliably gets backwards. Report
-   its result as returned; do not adjust the arithmetic.
+3. Call estimate_viewer_impact with the diagnosed fault_id. That is the ONLY
+   argument. The affected regions, the impact ratio and the incident duration
+   are all derived in code, deliberately: the impact ratio is the number a
+   model most reliably gets backwards, and the duration is one you cannot know
+   -- nothing in your context carries a timestamp. Report the result as
+   returned; do not adjust the arithmetic.
 
-4. Call annotate_dashboard with a concise incident note. Pass
-   started_at_epoch so the annotation lands at the INCIDENT time, not now --
-   an annotation in the wrong place is worse than none, because it misleads
-   whoever scrubs the dashboard later.
+4. Call annotate_dashboard with a concise incident note, a region and the
+   fault. Do NOT pass a timestamp; the incident start is read from the alert in
+   code, so the annotation lands where an operator scrubbing the dashboard
+   would look for it.
 
-5. Call record_incident with a title, summary, and started_at_epoch so a
-   fallback annotation lands at the incident rather than an hour ago. If IRM is
-   unavailable the tool falls back to a tagged annotation and tells you so in
-   its "backend" field; carry that into incident_backend rather than reporting
-   a bare id, which would imply an IRM incident exists when it does not.
+5. Call record_incident with a title and summary. The start time is again
+   derived in code. If IRM is unavailable the tool falls back to a tagged
+   annotation and tells you so in its "backend" field; carry that into
+   incident_backend rather than reporting a bare id, which would imply an IRM
+   incident exists when it does not.
 
 Report every tool error verbatim. Never claim an annotation or incident was
 created if the tool said otherwise.""",
-    tools=[verify_recovery, verify_visual_recovery, annotate_dashboard,
+    # verify_recovery and verify_visual_recovery are deliberately NOT here.
+    # Exposing both made the choice between them a prompt decision; routing now
+    # happens in code inside verify_recovery_for_diagnosis, which makes
+    # verifying a content fault with a delivery metric unreachable rather than
+    # merely discouraged.
+    tools=[verify_recovery_for_diagnosis, annotate_dashboard,
            record_incident, estimate_viewer_impact],
     # Reads ONLY its templated inputs above, so the replayed session history is
     # dead freight -- see docs/agent-performance.md. ADK keeps this agent's own

@@ -254,11 +254,24 @@ def inspect_frame(region: str, rendition: str) -> dict:
     return verdict
 
 
-def check_rung_resolution(region: str) -> dict:
+def check_rung_resolution(region: str, tool_context=None) -> dict:
     """Measure whether the 1080p rung carries the detail it advertises.
 
     DETERMINISTIC. This is a measurement, not a judgement, and it is the only
-    authority on ladder_mismatch. Vision cannot detect this fault -- no model
+    authority on ladder_mismatch.
+
+    THE MEASUREMENT IS WRITTEN TO STATE, not just returned. schemas.py:100 says
+    resolution is "measured in code", but the value reached the deterministic
+    checklist only after the model had read this dict, re-typed the verdict into
+    VisualFinding, and had that transcription read back out -- so the one thing
+    the repo calls deterministic was travelling as LLM-transcribed prose. One
+    mistyped enum (`inconclusive` where the tool measured `suspect_upscaled`)
+    silently turned ladder_mismatch unconfirmable, and because a content fault
+    moves no delivery metric, HEALTHY would then confirm on a plant serving an
+    upscaled top rung.
+
+    The tool now records its own result under `rung_measurement`, and
+    attach_visual_evidence prefers it over anything the model wrote. Vision cannot detect this fault -- no model
     tier separates an upscaled rung from a healthy one, and asking produces
     confident wrong answers (docs/vision-spike.md).
 
@@ -301,4 +314,20 @@ def check_rung_resolution(region: str) -> dict:
     out = compare_rungs(hi, lo, "1080p", "720p")
     out["region"] = region
     out["method"] = "deterministic round-trip PSNR ratio (no model involved)"
+    _record_rung_measurement(out, tool_context)
     return out
+
+
+def _record_rung_measurement(out, tool_context):
+    """Persist the measurement so the checklist never has to trust a retelling."""
+    if tool_context is None:
+        return
+    try:
+        tool_context.state["rung_measurement"] = {
+            "verdict": out.get("verdict"),
+            "ratio": out.get("ratio"),
+            "region": out.get("region"),
+            "source": "check_rung_resolution (code)",
+        }
+    except Exception:                                  # noqa: BLE001
+        pass                    # never fail a measurement to record it

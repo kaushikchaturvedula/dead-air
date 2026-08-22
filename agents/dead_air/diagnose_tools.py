@@ -49,6 +49,27 @@ Q_ENCODER_FPS = 'max(encoder_fps)'
 Q_RUNGS = 'max(encoder_rungs_active)'
 Q_DROPPED = 'max(rate(dropped_frames[5m]))'
 
+# --- Source liveness -------------------------------------------------------
+# THE PROBLEM THESE SOLVE. An empty PromQL result means two completely
+# different things depending on the metric, and the checklist was reading both
+# as "we looked and everything is fine":
+#
+#   rate(segment_status{status="4xx"}) empty  -> genuinely no 404s. An
+#                                                OBSERVATION of health.
+#   viewer_rebuffer_seconds_total     empty  -> the viewer fleet is gone. We
+#                                                know NOTHING about rebuffering.
+#
+# Both produced `{}`, and `len({}) == 0` passed a required "no region is
+# rebuffering" check either way, so a dead fleet during a live fault scored
+# no_fault_detected at HIGH confidence.
+#
+# These count the exporter's own series rather than the condition. If the
+# counter exists at all, the exporter is reporting and an absent condition is a
+# real absence; if it does not, every check derived from it is not_evaluated.
+Q_VIEWERS_PRESENT = 'count(viewer_playing_seconds_total)'
+Q_EDGES_PRESENT = 'count(segment_status)'
+Q_ENCODER_PRESENT = 'count(encoder_up)'
+
 
 def _grafana(path, params=None, timeout=45):
     base = os.environ["GRAFANA_URL"].rstrip("/")
@@ -83,6 +104,20 @@ def _promql(query):
 
 def _clean(d):
     return {k: v for k, v in d.items() if k != "__error__"}
+
+
+def _source_reporting(query):
+    """True if the exporter is publishing, False if not, None if we cannot ask.
+
+    The three-way return is the point. False means "queried Mimir successfully
+    and this exporter has no series" -- a real observation. None means the query
+    itself failed, so we do not even know that much, and any check downstream
+    must come back not_evaluated rather than guessing.
+    """
+    raw = _promql(query)
+    if "__error__" in raw:
+        return None
+    return bool(_clean(raw))
 
 
 def _manifest_rungs(region):
@@ -140,9 +175,22 @@ def collect_evidence(region: str = "us-east1") -> dict:
     status, hot_regions = _fourxx_status(recent, earlier)
     rungs = _manifest_rungs(region)
 
-    def scalar(q, default=None):
-        v = _clean(_promql(q))
-        return next(iter(v.values()), default)
+    def scalar(q, name):
+        """A single value, or None -- never a default that reads as a reading.
+
+        This used to take `default=0` and return it on any failure, so a
+        transport error or a metric that had not landed in Mimir yet became
+        `encoder_up=0`, indistinguishable from an encoder that is genuinely
+        down. The failure was recorded nowhere: `_clean` strips `__error__`,
+        and unlike the six queries above it, a scalar failure never reached
+        `query_errors`. It presented as the agent reasoning correctly about a
+        broken plant rather than as the agent being blind.
+        """
+        raw = _promql(q)
+        if "__error__" in raw:
+            errors.append(f"{name}: {raw['__error__']}")
+            return None
+        return next(iter(_clean(raw).values()), None)
 
     evidence = {
         "regions_seen": sorted(set(rebuffer) | set(bitrate) | set(ttfb)) or REGIONS,
@@ -158,10 +206,24 @@ def collect_evidence(region: str = "us-east1") -> dict:
         "manifest_rungs": rungs,
         "missing_rungs": ([r for r in FULL_LADDER if r not in rungs]
                           if rungs is not None else None),
-        "encoder_up": scalar(Q_ENCODER_UP, 0),
-        "encoder_fps": scalar(Q_ENCODER_FPS, 0),
-        "rungs_active": scalar(Q_RUNGS, 0),
-        "dropped_frames_rate": scalar(Q_DROPPED, 0),
+        # None here means the manifest FETCH FAILED, not that the ladder is
+        # complete. Read asymmetrically it used to both rule ladder_collapse
+        # OUT (bool(None) -> the required "a rung is missing" check failed) and
+        # vacuously PASS the healthy ladder check (`not (None or [])`), so one
+        # slow edge on a cold start eliminated the fault and confirmed health
+        # in the same evaluation.
+        "manifest_fetched": rungs is not None,
+        "encoder_up": scalar(Q_ENCODER_UP, "encoder_up"),
+        "encoder_fps": scalar(Q_ENCODER_FPS, "encoder_fps"),
+        "rungs_active": scalar(Q_RUNGS, "encoder_rungs_active"),
+        "dropped_frames_rate": scalar(Q_DROPPED, "dropped_frames"),
+        # Which exporters are actually publishing. Every absence-based check
+        # consults this before reading an empty result as good news.
+        "sources_reporting": {
+            "viewers": _source_reporting(Q_VIEWERS_PRESENT),
+            "edges": _source_reporting(Q_EDGES_PRESENT),
+            "encoder": _source_reporting(Q_ENCODER_PRESENT),
+        },
         "query_errors": errors,
         "fourxx_discriminator_note": (
             "status 'ongoing' means 404s are still happening (segment_gap); "
@@ -199,13 +261,43 @@ def match_fault_signatures(region: str, tool_context=None) -> dict:
     if tool_context is not None:
         try:
             evidence = attach_visual_evidence(
-                evidence, tool_context.state.get("visual_finding"))
+                evidence, tool_context.state.get("visual_finding"),
+                tool_context.state.get("rung_measurement"))
         except Exception:                              # noqa: BLE001
             pass
 
     result = evaluate_all(evidence)
     result["evidence"] = evidence
     result["visual_evidence_available"] = bool(evidence.get("visual"))
+
+    # SURFACE THE BLIND SPOTS. `query_errors` was collected here and read
+    # nowhere -- one grep hit, the write. So a run where half the queries failed
+    # was indistinguishable in the output from a run where they all succeeded
+    # and the plant was fine. Anything the checklist could not see is now
+    # reported next to the verdict, and named in the Diagnosis schema, so it
+    # reaches the operator rather than dying in a dict.
+    srcs = evidence.get("sources_reporting") or {}
+    blind = []
+    for name, state in srcs.items():
+        if state is False:
+            blind.append(f"{name}: exporter is publishing no series at all")
+        elif state is None:
+            blind.append(f"{name}: could not determine whether it is reporting")
+    if evidence.get("manifest_fetched") is False:
+        blind.append("master manifest: fetch failed, ladder state unknown")
+    for e in evidence.get("query_errors") or []:
+        blind.append(f"query failed -- {e}")
+
+    result["blind_spots"] = blind
+    result["evidence_complete"] = not blind
+    if blind:
+        result["blind_spot_note"] = (
+            "The checklist could NOT see the things listed in blind_spots. "
+            "Checks depending on them are 'not_evaluated', which makes their "
+            "signatures 'unconfirmable' -- deliberately NOT 'ruled out'. Do not "
+            "describe anything above as healthy or eliminated on the strength "
+            "of evidence that was never collected; say what was not visible."
+        )
     if not evidence.get("visual"):
         result["visual_note"] = (
             "Phase 2 did not run, so black_source and ladder_mismatch cannot be "
@@ -215,8 +307,16 @@ def match_fault_signatures(region: str, tool_context=None) -> dict:
     return result
 
 
-def attach_visual_evidence(evidence: dict, visual_finding) -> dict:
-    """Fold a VisualFinding (dict or JSON string) into collected evidence."""
+def attach_visual_evidence(evidence: dict, visual_finding,
+                           rung_measurement=None) -> dict:
+    """Fold a VisualFinding (dict or JSON string) into collected evidence.
+
+    `rung_measurement` is what check_rung_resolution actually measured, read
+    from session state. It WINS over the same field inside visual_finding,
+    which is the model's retyping of it. The rung verdict is the sole required
+    check for ladder_mismatch and the repo calls it "decided in code, never by
+    vision" -- so it must not arrive here having passed through a paraphrase.
+    """
     if not visual_finding:
         return evidence
     if isinstance(visual_finding, str):
@@ -232,4 +332,23 @@ def attach_visual_evidence(evidence: dict, visual_finding) -> dict:
             "rung_resolution_verdict": visual_finding.get("rung_resolution_verdict"),
             "rung_resolution_ratio": visual_finding.get("rung_resolution_ratio"),
         }
+        if isinstance(rung_measurement, str):
+            try:
+                rung_measurement = json.loads(rung_measurement)
+            except json.JSONDecodeError:
+                rung_measurement = None
+        if isinstance(rung_measurement, dict) and rung_measurement.get("verdict"):
+            reported = evidence["visual"]["rung_resolution_verdict"]
+            measured = rung_measurement["verdict"]
+            evidence["visual"]["rung_resolution_verdict"] = measured
+            evidence["visual"]["rung_resolution_ratio"] = rung_measurement.get(
+                "ratio", evidence["visual"]["rung_resolution_ratio"])
+            evidence["visual"]["rung_verdict_source"] = "measured in code"
+            if reported and reported != measured:
+                # Worth shouting about: it means the transcription path that
+                # used to be authoritative would have produced a different
+                # diagnosis from the measurement.
+                evidence["visual"]["rung_transcription_mismatch"] = (
+                    f"Phase 2 reported {reported!r} but check_rung_resolution "
+                    f"measured {measured!r}; the measurement is authoritative.")
     return evidence
