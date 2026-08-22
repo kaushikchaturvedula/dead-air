@@ -364,6 +364,20 @@ in `europe-west1` needs a publicly reachable origin, so deploying L2 to Cloud
 Run silently requires L1 on GCE first. Local has no such ordering constraint,
 which makes it the cheaper place to be wrong.
 
+## Documentation
+
+| | |
+| --- | --- |
+| [docs/demo-runbook.md](docs/demo-runbook.md) | how to drive the demo, with measured timings for every beat |
+| [docs/plant.md](docs/plant.md) | the simulated broadcast plant, and the fault menu with measured signatures |
+| [docs/agent.md](docs/agent.md) | the five-phase agent, and why the sweep exists |
+| [docs/content-screen.md](docs/content-screen.md) | Stage 0's calibration, and the burned-in-timecode trap |
+| [docs/agent-performance.md](docs/agent-performance.md) | where the time and the tokens actually go |
+| [docs/vision-spike.md](docs/vision-spike.md) | what vision can and cannot see, measured per model tier |
+| [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md) | cloud steps 1 and 2, executed and measured |
+| [docs/audit-2026-08-21.md](docs/audit-2026-08-21.md) | a full read-only audit: 30 verified findings, and an honest list of what was **not** verified |
+| [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md) | which Grafana MCP tools each specialist is pinned to |
+
 ## License
 
 [Apache-2.0](LICENSE)
