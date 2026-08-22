@@ -60,8 +60,36 @@ _YHIGH_RE = re.compile(r"lavfi\.signalstats\.YHIGH=([0-9.]+)")
 _FREEZE_RE = re.compile(r"freeze_start")
 
 
+class FfmpegMissing(RuntimeError):
+    """ffmpeg is not on PATH. Fatal, and deliberately not catchable as 'clear'."""
+
+
+def require_ffmpeg():
+    """Fail loudly and early if the host has no ffmpeg.
+
+    THIS IS A HOST PREREQUISITE AND ITS ABSENCE USED TO READ AS HEALTH. Stock
+    macOS and Ubuntu do not ship ffmpeg; the venv and Docker Desktop do not
+    supply it. Without it `ffmpeg` raises FileNotFoundError, which screen_media
+    caught as a generic exception and returned as `{"suspect": False}` -- and
+    "not suspect" is the same shape as "the picture is fine".
+
+    Downstream that becomes: no frame available -> black_source unconfirmable ->
+    HEALTHY's remaining checks are all delivery metrics, which pass during a
+    blackout -> no_fault_detected at HIGH confidence. A missing binary reported
+    as a healthy plant, during the one fault this project exists to catch.
+    """
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        raise FfmpegMissing(
+            "ffmpeg is not on PATH. It is a HOST prerequisite for the content "
+            "screen, the frame grabs and the rung measurement -- install it "
+            "(macOS: brew install ffmpeg; Debian/Ubuntu: apt install ffmpeg) "
+            "and re-run. Without it the agent cannot see the picture at all.")
+
+
 def _run_screen(path, timeout=60):
     """One ffmpeg pass. YAVG/YHIGH to stdout, freeze events to stderr."""
+    require_ffmpeg()
     cmd = [
         "ffmpeg", "-v", "info", "-nostdin", "-i", path,
         "-vf", ("signalstats,"
@@ -82,6 +110,10 @@ def screen_media(path: str) -> dict:
     Returns:
         dict with suspect, reason, and the measurements behind the call.
     """
+    # NOT caught below. A missing ffmpeg is a broken installation, not an
+    # observation about the picture, and every other exit from this function
+    # returns suspect=False -- which reads as "the picture is fine".
+    require_ffmpeg()
     try:
         out, err = _run_screen(path)
     except subprocess.TimeoutExpired:

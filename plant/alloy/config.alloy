@@ -101,6 +101,36 @@ prometheus.scrape "plant" {
 prometheus.relabel "cardinality_guard" {
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 
+  // -------------------------------------------------------------------------
+  // THE ANSWER KEY NEVER LEAVES THE PLANT
+  // -------------------------------------------------------------------------
+  // `encoder_chaos_active` and `edge_chaos_active` are 1 exactly when a fault
+  // has been injected. They are the ground truth the agent is supposed to
+  // DEDUCE, and they were being written into the same Mimir the agent queries
+  // with arbitrary PromQL through the MCP server -- `encoder_chaos_active`
+  // covers black_source, the fault the entire demo is built on.
+  //
+  // Nothing in the agent read them, and no prompt mentions them. But "we asked
+  // it not to" is not an argument anyone should have to accept: a reasonable
+  // judge looking at a dashboard panel titled "Injected chaos by region" can
+  // ask whether the agent is just reading the answer, and the honest response
+  // is to make it impossible rather than to promise it did not happen.
+  //
+  // Dropped here, at the collector, so the series never reaches Mimir at all.
+  // The agent's entire metrics surface is the Grafana datasource, so a series
+  // that is not there cannot be queried by any expression it might compose.
+  // Verify with:
+  //   curl -s localhost:8081/metrics | grep chaos     # present locally
+  //   promql edge_chaos_active                        # 0 series in Mimir
+  //
+  // The operator can still see injected state via `make chaos-status`, which
+  // reads the containers directly and bypasses this path entirely.
+  rule {
+    action        = "drop"
+    source_labels = ["__name__"]
+    regex         = "encoder_chaos_active|edge_chaos_active"
+  }
+
   // Drop unbounded per-entity labels before remote_write. `labeldrop` matches
   // on LABEL NAMES; the regex must be a full-string match.
   //

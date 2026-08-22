@@ -263,10 +263,46 @@ def hop_alloy():
     if sent <= 0:
         print(f"{BAD} alloy: no samples sent yet (wait ~30s after plant-up)")
         return False
-    if failed > 0:
-        print(f"{BAD} alloy: {int(sent)} sent but {int(failed)} FAILED")
-        print("       -> check GRAFANA_CLOUD_METRICS_TOKEN / GRAFANA_MIMIR_USER")
+
+    # THESE ARE LIFETIME COUNTERS, so "failed > 0" answers "has anything ever
+    # failed", not "is the pipeline working". Any transient blip -- Mimir
+    # returning EOF, a request deadline -- makes Alloy retry a batch that can
+    # then age past Mimir's out-of-order window and get rejected permanently
+    # (err-mimir-sample-timestamp-too-old). The counter never comes back down,
+    # so a plant that has been up for hours eventually fails this check forever,
+    # and it did: 249 failures against 220,000 delivered, from three blips,
+    # while the pipeline was demonstrably healthy. The advice it printed --
+    # check your token and instance id -- was wrong in exactly the way that
+    # costs an hour on demo day.
+    #
+    # So sample twice and judge on the DELTA: are samples failing NOW?
+    time.sleep(3)
+    try:
+        body2 = get(ALLOY_METRICS, timeout=5)
+    except Exception:
+        body2 = body
+    failed2 = 0.0
+    for l in body2.splitlines():
+        if l.startswith("prometheus_remote_storage_samples_failed_total") \
+                and not l.startswith("#"):
+            try:
+                failed2 += float(l.split()[-1])
+            except ValueError:
+                pass
+    failing_now = failed2 > failed
+
+    if failing_now:
+        print(f"{BAD} alloy: samples are failing RIGHT NOW "
+              f"({int(failed2 - failed)} in the last 3s, {int(failed2)} lifetime)")
+        print("       -> check GRAFANA_CLOUD_METRICS_TOKEN / GRAFANA_MIMIR_USER, "
+              "and `docker logs deadair-alloy | grep non-recoverable` for the "
+              "server's own reason")
         return False
+    if failed > 0:
+        pct = 100.0 * failed / sent
+        print(f"{OK} alloy: {int(sent)} samples delivered, none failing now "
+              f"({int(failed)} lifetime failures, {pct:.3f}%, not increasing)")
+        return True
     print(f"{OK} alloy: {int(sent)} samples delivered, 0 failed")
     return True
 
@@ -472,9 +508,22 @@ def hop_traces(env):
         print(f"{WARN} traces: Tempo query failed ({e})")
         return False
     if not traces:
+        # Only blame sampling once the transport is known to be configured.
+        # Blaming it unconditionally is what turned an unset GRAFANA_TEMPO_GRPC
+        # into "raise TRACE_SAMPLE_RATIO" -- advice that cannot work, on a
+        # pipeline with no endpoint.
+        if not env.get("GRAFANA_TEMPO_GRPC") or not env.get("GRAFANA_TEMPO_USER"):
+            print(f"{BAD} traces: none in Tempo, and the Tempo exporter is NOT "
+                  f"CONFIGURED")
+            print("       -> GRAFANA_TEMPO_GRPC / GRAFANA_TEMPO_USER are unset, "
+                  "so Alloy has no endpoint to export to and every span is "
+                  "dropped. This is not a sampling problem and raising "
+                  "TRACE_SAMPLE_RATIO will not help.")
+            return False
         print(f"{WARN} traces: no client->edge->origin traces in the last 15m")
-        print("       -> a cache-miss fetch must be sampled; raise "
-              "TRACE_SAMPLE_RATIO if this is persistently empty")
+        print(f"       -> the exporter IS configured ({env.get('GRAFANA_TEMPO_GRPC')}), "
+              "so this is a sampling or warm-up question: a cache-miss fetch "
+              "must be sampled; raise TRACE_SAMPLE_RATIO if persistently empty")
         return False
 
     note = f", {int(failed)} failed" if failed else ""
@@ -484,9 +533,58 @@ def hop_traces(env):
     return True
 
 
+# Every variable the pipeline needs, and which signal dies without it.
+#
+# WHY THIS IS A PRECONDITION AND NOT A WARNING. GRAFANA_TEMPO_USER and
+# GRAFANA_TEMPO_GRPC are read by plant/alloy/config.alloy and were absent from
+# .env.example entirely. Alloy's sys.env() returns "" for a missing variable and
+# starts cleanly -- verified: `alloy validate` exits 0 with both empty -- so the
+# OTLP trace exporter simply has no endpoint and every span is dropped. This
+# script then reported "no client->edge->origin traces in the last 15m -> raise
+# TRACE_SAMPLE_RATIO", pointing at sampling on a pipeline that was never
+# configured, and exited 0.
+#
+# A cold clone therefore lost a THIRD of the three-signal story and was told to
+# wait. Missing configuration is not a warm-up condition and must not be
+# reported as one.
+REQUIRED_CONFIG = [
+    ("GRAFANA_URL", "everything -- the Grafana stack to query"),
+    ("GRAFANA_SERVICE_ACCOUNT_TOKEN", "everything -- Grafana API auth"),
+    ("GRAFANA_MIMIR_URL", "metrics -- Alloy's remote_write endpoint"),
+    ("GRAFANA_MIMIR_USER", "metrics -- Mimir instance id"),
+    ("GRAFANA_CLOUD_METRICS_TOKEN", "metrics and logs -- access policy token"),
+    ("GRAFANA_LOKI_URL", "logs -- Loki push endpoint"),
+    ("GRAFANA_LOKI_USER", "logs -- Loki instance id"),
+    ("GRAFANA_TEMPO_USER", "traces -- Tempo instance id"),
+    ("GRAFANA_TEMPO_GRPC", "traces -- Tempo OTLP/gRPC endpoint"),
+]
+
+
+def hop_config(env):
+    """Fail before querying anything if the pipeline cannot be configured."""
+    missing = [(k, why) for k, why in REQUIRED_CONFIG if not env.get(k)]
+    if not missing:
+        print(f"{OK} config: all {len(REQUIRED_CONFIG)} required variables set")
+        return True
+    print(f"{BAD} config: {len(missing)} required variable(s) missing from "
+          f"{os.path.relpath(ENV_PATH, REPO)}")
+    for k, why in missing:
+        print(f"       {k:<32} needed for {why}")
+    print("       -> copy agents/grafana_probe/.env.example and fill these in. "
+          "Without them the affected signal is silently dropped, NOT delayed: "
+          "Alloy starts cleanly with an empty endpoint and every span or sample "
+          "for that signal goes nowhere.")
+    return False
+
+
 def main():
     env = load_env(ENV_PATH)
     print("DEAD AIR plant\n")
+
+    # Before any hop, because a config gap masquerades as a warm-up delay and
+    # would otherwise be diagnosed as one 400 lines later.
+    if not hop_config(env):
+        sys.exit(1)
 
     required = [
         ("emitter", hop_emitter()),

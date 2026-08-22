@@ -32,7 +32,10 @@ service-account*.json
 
 # --- Generated media (HLS segments, playlists, captures) ---
 media/
-frames/
+# ANCHORED. A bare `frames/` matches at any depth, so it also swallowed
+# fixtures/frames/ -- the calibration corpus -- which is not what this rule is
+# for. This one is the top-level scratch dir that `make frame` writes to.
+/frames/
 # NOTE: HLS segments use .ts, which collides with TypeScript sources. These
 # patterns are scoped to media dirs so a future web dashboard is not swallowed.
 media/**/*.ts
@@ -51,4 +54,14 @@ CLAUDE.md
 
 # --- OS ---
 .DS_Store
-fixtures/
+
+# fixtures/ is NOT ignored. The 69 stills under fixtures/frames/ are the corpus
+# `make screen-calibrate` scores, and the 100%-detection / 0%-false-positive
+# table in docs/content-screen.md is only reproducible by someone who has them.
+# Ignoring them meant a cold clone could read the claim and not check it, which
+# is the wrong way round for the one number the content screen rests on.
+# 9MB of PNGs is a cheap price for a reproducible result.
+#
+# fixtures/crops/ IS ignored: it is derived from frames/ by
+# scripts/fault_signatures.py and only scripts/vision_eval.py consumes it.
+fixtures/crops/

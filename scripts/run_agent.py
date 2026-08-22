@@ -343,7 +343,28 @@ def _legacy_sweep(interval, region, timeout=None, approval_mode="deny"):
         time.sleep(interval)
 
 
+def _preflight():
+    """Refuse to start if a host prerequisite is missing.
+
+    Checked here, before any run, so a cold clone gets one clear line instead
+    of discovering it on the first sweep tick -- where a missing ffmpeg used to
+    surface as `suspect: False`, i.e. as a healthy picture.
+    """
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        print("error: ffmpeg is not on PATH.\n"
+              "       It is a host prerequisite for the Stage 0 content screen, "
+              "the frame grabs\n"
+              "       and the rung measurement -- without it this agent cannot "
+              "see the picture.\n"
+              "         macOS:  brew install ffmpeg\n"
+              "         Debian: sudo apt install ffmpeg",
+              file=sys.stderr)
+        sys.exit(2)
+
+
 def main():
+    _preflight()
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", help="run once for this region")
     ap.add_argument("--alert-name", default="DEAD AIR / manual trigger")

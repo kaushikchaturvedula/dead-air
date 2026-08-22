@@ -88,8 +88,18 @@ service-account token instead.
 
 ## Setup
 
-Requires Python 3.10+, Docker, and a Google Cloud project with Vertex AI
-enabled.
+Requires Python 3.10+, Docker, **ffmpeg on the host**, and a Google Cloud
+project with Vertex AI enabled.
+
+`ffmpeg` is not optional and is not supplied by the venv or by Docker Desktop:
+the Stage 0 content screen, the frame grabs and the rung-resolution measurement
+all shell out to it on the host. Stock macOS and Ubuntu do not ship it.
+
+```bash
+brew install ffmpeg          # macOS
+sudo apt install ffmpeg      # Debian / Ubuntu
+ffmpeg -version              # must print a version
+```
 
 ```bash
 git clone https://github.com/kaushikchaturvedula/dead-air.git

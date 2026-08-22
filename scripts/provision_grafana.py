@@ -107,7 +107,7 @@ LAYOUT = {
     11: (0, 11, 8, 8),   12: (8, 11, 16, 8),
     13: (0, 19, 6, 5),   14: (6, 19, 6, 5),
     20: (0, 24, 24, 1),                                   # row: L2
-    21: (0, 25, 16, 9),  22: (16, 25, 8, 9),
+    21: (0, 25, 24, 9),   # 22 removed (answer key); 21 widens to fill
     23: (0, 34, 12, 8),  24: (12, 34, 12, 8),
     30: (0, 42, 24, 1),                                   # row: L3
     31: (0, 43, 16, 9),  32: (16, 43, 8, 9),
@@ -563,21 +563,17 @@ def dashboard_model():
                     "overrides": [],
                 },
             },
-            {
-                "id": 22,
-                "type": "timeseries",
-                "title": "Injected chaos by region",
-                "description": "Which region is currently being degraded, "
-                               "reported by the edges themselves.",
-                "gridPos": {"h": 9, "w": 8, "x": 16, "y": 36},
-                "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
-                "targets": [target("edge_chaos_active", "{{region}}")],
-                "fieldConfig": {
-                    "defaults": {"custom": {"lineWidth": 2, "fillOpacity": 20},
-                                 "min": 0, "max": 1},
-                    "overrides": [],
-                },
-            },
+            # PANEL 22 ("Injected chaos by region") REMOVED, deliberately.
+            #
+            # It plotted edge_chaos_active -- the answer key. That metric is now
+            # dropped at the collector (plant/alloy/config.alloy) so it never
+            # reaches Mimir, which would have left this panel permanently empty;
+            # but the panel is gone for its own reason, not just that one.
+            # A dashboard that displays "here is the fault we injected" beside
+            # an agent's diagnosis invites exactly one question, and the answer
+            # should be structural, not a promise. Injected state is still
+            # visible to the operator through `make chaos-status`, which reads
+            # the containers directly.
             {
                 "id": 23,
                 "type": "timeseries",
