@@ -299,7 +299,11 @@ round-trip separates the same frames by **10 dB with no overlap**
 choice is settled at `gemini-3.7-flash`, the only tier with a zero false-positive
 rate on healthy frames.
 
-## The agent — Phases 1–3 (working)
+## The agent — all five phases
+
+**6/6 correct** across every fault plus a healthy control, through the complete
+five-phase pipeline — scope, see, diagnose, human-gated act, and record with
+verified recovery. Reproduce with `make diagnose-eval`.
 
 ```bash
 make agent REGION=us-east1     # run once
@@ -307,6 +311,8 @@ make agent-watch               # REACTIVE: wake on every firing alert
 make agent-sweep               # PROACTIVE: confidence monitor on a timer
 make agent-tools               # show the pinned MCP subset
 make diagnose-checks           # score all 6 cases, deterministic, no model
+make diagnose-eval             # drive all 6 through the full agent
+make agent-profile             # where a run's time went, from its own traces
 ```
 
 **Two triggers, one pipeline.** Reactive (an alert fires) and proactive (a
