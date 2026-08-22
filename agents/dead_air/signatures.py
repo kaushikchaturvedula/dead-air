@@ -137,7 +137,11 @@ def _ttfb_elevated_regions(ev):
 # Values that mean "we did not actually look", as opposed to "we looked and saw
 # this". Treating them as observations is how a skipped Phase 2 turns into a
 # false elimination.
-_NO_FRAME_EVIDENCE = {None, "", "no_frame_available"}
+# "vision_unavailable" means the model stalled past its deadline and the call
+# was abandoned. That is a fact about Vertex, not about the picture, so it must
+# route to not_evaluated -- left out of this set it would read as an observation
+# and RULE OUT black_source on the strength of a timeout.
+_NO_FRAME_EVIDENCE = {None, "", "no_frame_available", "vision_unavailable"}
 _NO_RUNG_EVIDENCE = {None, "", "not_checked", "inconclusive"}
 
 
@@ -395,7 +399,19 @@ def evaluate_all(evidence: dict) -> dict:
         else:
             verdict, confidence = "ambiguous", "low"
     elif healthy["status"] == "confirmed":
-        verdict, confidence = "no_fault_detected", "high"
+        # HEALTHY's required checks are ALL delivery metrics, and every one of
+        # them passes during a total blackout -- that is the premise of this
+        # project. So "the plant is healthy" is only a high-confidence claim
+        # when the picture was actually looked at. If the frame check came back
+        # not_evaluated -- Phase 2 skipped, ffmpeg missing, or the vision call
+        # abandoned at its deadline -- then black_source and ladder_mismatch
+        # were never excludable and the verdict is provisional.
+        frame_checked = any(
+            c["result"] in ("pass", "fail")
+            for c in healthy["checks"]
+            if c["check"].startswith("frame inspection"))
+        verdict = "no_fault_detected"
+        confidence = "high" if frame_checked else "medium"
     else:
         verdict, confidence = "no_signature_matched", "low"
 

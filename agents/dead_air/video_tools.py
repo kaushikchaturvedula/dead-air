@@ -197,6 +197,77 @@ def get_stream_manifest(region: str) -> dict:
     }
 
 
+class VisionDeadlineExceeded(RuntimeError):
+    """The vision call exceeded its TOTAL wall-clock budget."""
+
+
+# Total wall-clock ceiling for one vision call, in seconds.
+#
+# WHY A PER-REQUEST TIMEOUT WAS NOT ENOUGH. http_options.timeout is handed to
+# httpx, where a scalar becomes connect/read/write/pool -- and READ resets on
+# every chunk received. A response dribbled slowly therefore never trips it, and
+# httpx has no total-elapsed bound at all.
+#
+# Measured, not theorised: during a six-case eval a single generate_content call
+# ran for 1831.4 SECONDS and then SUCCEEDED, returning 128 output tokens. The
+# 120s per-request timeout did not fire because no individual read stalled that
+# long. The whole investigation took 2093.8s, of which Phase 2 was 89.1%.
+#
+# The 900s run ceiling did not save it either: run_agent wraps the invocation in
+# asyncio.wait_for, but ADK executes sync tools directly on the event loop
+# (function_tool.py: `if is_async: await target(...) else: return target(...)`),
+# so a blocking call prevents the timer from ever being scheduled. A ceiling
+# that cannot fire is not a ceiling.
+#
+# So the bound is enforced HERE, in a worker thread, where it does not depend on
+# the event loop being free or on httpx's notion of a timeout.
+VISION_DEADLINE_SECONDS = float(
+    os.environ.get("DEADAIR_VISION_DEADLINE", "150"))
+
+_vision_pool = None
+
+
+def _vision_call_bounded(png_bytes):
+    """Run one vision call under a hard total-elapsed deadline.
+
+    Uses a thread rather than a signal so it is safe off the main thread, and
+    rather than asyncio because the caller is a sync ADK tool. If the deadline
+    passes the worker is abandoned -- it holds only an HTTP socket, and the
+    alternative is blocking a broadcast incident on a model that has stopped
+    answering.
+    """
+    global _vision_pool
+    import concurrent.futures
+    if _vision_pool is None:
+        _vision_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="deadair-vision")
+
+    def _call():
+        return _genai_client().models.generate_content(
+            model=VISION_MODEL,
+            contents=[types.Part.from_text(text=VISION_PROMPT),
+                      types.Part.from_bytes(data=png_bytes,
+                                            mime_type="image/png")],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=VISION_SCHEMA,
+                temperature=0.0,
+            ),
+        )
+
+    fut = _vision_pool.submit(_call)
+    try:
+        return fut.result(timeout=VISION_DEADLINE_SECONDS)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise VisionDeadlineExceeded(
+            f"vision call exceeded its {VISION_DEADLINE_SECONDS:.0f}s total "
+            f"deadline and was abandoned. This is a HARD wall-clock bound: the "
+            f"per-request timeout cannot catch a slowly-dribbled response, and "
+            f"a measured call once ran 1831s before answering."
+        ) from None
+
+
 def inspect_frame(region: str, rendition: str) -> dict:
     """Fetch the newest segment for a rendition and inspect the picture.
 
@@ -233,17 +304,15 @@ def inspect_frame(region: str, rendition: str) -> dict:
     try:
         with open(path, "rb") as fh:
             data = fh.read()
-        resp = _genai_client().models.generate_content(
-            model=VISION_MODEL,
-            contents=[types.Part.from_text(text=VISION_PROMPT),
-                      types.Part.from_bytes(data=data, mime_type="image/png")],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=VISION_SCHEMA,
-                temperature=0.0,
-            ),
-        )
+        resp = _vision_call_bounded(data)
         verdict = json.loads(resp.text)
+    except VisionDeadlineExceeded as e:
+        # Deliberately NOT "no_frame_available": that is what we return when the
+        # rendition does not exist, and a stalled model is not an observation
+        # about the plant. Phase 2's synthesizer sees a distinct classification
+        # and cannot mistake this for a healthy picture.
+        return {"error": str(e), "region": region, "rendition": rendition,
+                "frame_path": path, "classification": "vision_unavailable"}
     except Exception as e:
         return {"error": f"vision call failed: {type(e).__name__}: {str(e)[:200]}",
                 "region": region, "rendition": rendition, "frame_path": path,

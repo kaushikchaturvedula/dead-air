@@ -107,6 +107,12 @@ class VisualFinding(BaseModel):
     frame_verdict: Literal[
         "healthy", "black_frame", "frozen_frame", "corrupted",
         "no_frame_available",
+        # The vision call exceeded its hard deadline and was abandoned. Distinct
+        # from no_frame_available (the rendition does not exist) because one is
+        # a fact about the model and the other about the plant. Both are treated
+        # as "we did not look" by the checklist; conflating them would let a
+        # Vertex stall eliminate a fault.
+        "vision_unavailable",
     ] = "no_frame_available"
     vision_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     visual_evidence: str = Field(

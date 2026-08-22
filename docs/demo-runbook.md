@@ -87,6 +87,8 @@ specialists run concurrently — keep it.
 | 4 act | 10.5s | keep — the approval gate is the trust story |
 | 5 record | 91.0s | **cut heavily** |
 
+A healthy-plant run is ~197s end to end; a black_source run ~169-245s.
+
 ### Restoring
 
 ```bash
@@ -144,9 +146,14 @@ that window.
 
 ## Known risks on camera
 
-1. **Vision has a 120s timeout and 3 retries now, but the network is still the
-   network.** If Vertex is unreachable at the moment Stage 0 fires, you get a
-   loud failure rather than a hang — retry the take.
+1. **Vision is bounded at 150s TOTAL, and that bound was earned.** A per-request
+   timeout is not enough: httpx resets its read timeout on every chunk, so a
+   slowly-dribbled response never trips it. Measured during a six-case eval, one
+   vision call ran **1831 seconds** and then succeeded, dragging that
+   investigation to 2093.8s — past the 900s run ceiling, which could not fire
+   because ADK runs sync tools on the event loop. There is now a hard
+   wall-clock deadline enforced in a worker thread. If it trips you get
+   `vision_unavailable` and a loud error, not a hang — retry the take.
 2. **Phase 5 is slow and always will be.** It waits on purpose. Plan the cut.
 3. **`make screen-calibrate` needs ffmpeg on the host**, like everything else
    that touches pixels. `ffmpeg -version` before you start.
