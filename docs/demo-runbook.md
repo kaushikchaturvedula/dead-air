@@ -169,7 +169,7 @@ that window.
 | symptom | check |
 | --- | --- |
 | content panel empty or orange | is `make agent-sweep` still running? |
-| terminal silent after `STAGE 0 SUSPECT` | vision call failing — it will error within 120s, not hang |
+| terminal silent after `STAGE 0 SUSPECT` | vision call slow — it is bounded at 150s total and will return `vision_unavailable` rather than hang |
 | dashboard panels all "No data" | `make verify` — probably a config or credential issue, not the plant |
 | agent diagnoses the wrong fault | `make chaos-status` — is more than one fault injected? |
 | everything green but the picture is black | that is the demo working |
