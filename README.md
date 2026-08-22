@@ -368,6 +368,7 @@ which makes it the cheaper place to be wrong.
 
 | | |
 | --- | --- |
+| [docs/architecture.md](docs/architecture.md) | **start here** — the whole system in one diagram, and what is decided by code rather than by the model |
 | [docs/demo-runbook.md](docs/demo-runbook.md) | how to drive the demo, with measured timings for every beat |
 | [docs/plant.md](docs/plant.md) | the simulated broadcast plant, and the fault menu with measured signatures |
 | [docs/agent.md](docs/agent.md) | the five-phase agent, and why the sweep exists |
