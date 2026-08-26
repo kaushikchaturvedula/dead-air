@@ -125,17 +125,59 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp agents/grafana_probe/.env.example agents/grafana_probe/.env
-# then edit .env: set GOOGLE_CLOUD_PROJECT and GRAFANA_SERVICE_ACCOUNT_TOKEN
-# (a Grafana service-account token -- create one in your Grafana stack under
-#  Administration > Users and access > Service accounts)
+# then fill it in. Every key is documented in the example file; `make verify`
+# below fails loudly and by name if any are missing.
 
 gcloud auth application-default login
-
-# start the self-hosted Grafana MCP server on localhost:8010
-docker compose up -d mcp-grafana
 ```
 
-Run the Grafana MCP connectivity probe:
+### See it work
+
+The shortest path from a fresh clone to watching the agent catch dead air.
+**Three terminals**, called T1/T2/T3 here.
+
+```bash
+# ---- T1: bring up the plant ----
+make plant-up          # 20-42s. Blocks until encoder/origin/edges are healthy.
+
+# WAIT ~2 MINUTES. plant-up returns as soon as the plant is SERVING, but Alloy
+# has not yet delivered enough to Mimir. Running verify immediately fails at the
+# mimir hop — that is the pipeline being honest, not a broken plant.
+
+make verify            # must print 15/15 PASS before anything below is meaningful
+make provision         # pushes the dashboard + alert rule; prints the dashboard URL
+```
+
+```bash
+# ---- T2: START THIS BEFORE OPENING THE DASHBOARD ----
+make agent-sweep INTERVAL=10
+```
+
+The content panels are fed by this sweep. With nothing running there are no
+samples, and Prometheus serves the last value for ~5 minutes — so the panel
+carrying the whole thesis would read green over a black stream. Start the sweep,
+wait for two `clear` ticks, *then* open the dashboard.
+
+```bash
+# ---- browser ----
+make player            # the picture
+
+# ---- T3: break it, then fix it ----
+make black-source      # the screen goes black; every delivery metric stays green
+make restore-source    # and back. Give ABR ~120s to settle before a second run.
+```
+
+Watch T2: Stage 0 flags the black frame in **~12.5s** with no model call at all,
+vision classifies it ~5s later, and the five-phase investigation runs from there.
+The full beat sheet, with measured timings and what to say over each screen, is
+in **[docs/demo-runbook.md](docs/demo-runbook.md)**.
+
+<details>
+<summary>How this was bootstrapped — the day-one MCP connectivity probe</summary>
+
+Before any of the above existed, the first thing built was a bare ADK agent that
+did nothing but list the Grafana MCP server's tools, to prove a headless agent
+could authenticate at all. It is still in the repo and still works:
 
 ```bash
 cd agents
@@ -143,11 +185,13 @@ adk web
 ```
 
 Open the URL it prints, pick the `grafana_probe` agent, and ask it about your
-stack. The MCP server authenticates to Grafana with the service-account token —
-no browser handshake involved.
+stack. The MCP server authenticates with the service-account token — no browser
+handshake involved, which is the whole reason it is self-hosted.
 
-The tools the MCP server exposes are catalogued in
-[docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md).
+This is a connectivity check, not the product. The tools it exposes are
+catalogued in [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md).
+
+</details>
 
 ## The plant
 
