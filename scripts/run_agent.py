@@ -47,6 +47,9 @@ from google.genai import types                                   # noqa: E402
 
 from dead_air.agent import root_agent                            # noqa: E402
 from dead_air.content_screen import screen_live_segment          # noqa: E402
+from dead_air.content_metrics import (                           # noqa: E402
+    CONTENT_STALE_AFTER_SECONDS,
+)
 from dead_air.video_tools import inspect_frame                   # noqa: E402
 from dead_air.observability import reset_usage, usage_totals     # noqa: E402
 
@@ -468,13 +471,13 @@ class _ContentMonitor:
             return (f"content monitor published NOTHING during the "
                     f"investigation ({self.errors} failed) -- THE PANEL WENT "
                     f"STALE")
-        stale = self.max_gap > 90        # CONTENT_STALE_AFTER_SECONDS
+        stale = self.max_gap > CONTENT_STALE_AFTER_SECONDS
         msg = (f"content monitor published {self.ticks} screen(s) during the "
                f"investigation, largest gap {self.max_gap:.0f}s")
         if self.errors:
             msg += f", {self.errors} failed"
-        return msg + (" -- EXCEEDED the 90s staleness budget" if stale
-                      else " -- panel stayed live")
+        return msg + (f" -- EXCEEDED the {CONTENT_STALE_AFTER_SECONDS}s "
+                      f"staleness budget" if stale else " -- panel stayed live")
 
 
 def _legacy_sweep(interval, region, timeout=None, approval_mode="deny"):
@@ -530,9 +533,10 @@ def main():
     ap.add_argument("--poll", type=int, default=15)
     ap.add_argument("--sweep", action="store_true",
                     help="proactive confidence monitor: run on a timer")
-    ap.add_argument("--interval", type=int, default=30,
-                    help="seconds between cascade ticks. Stage 0 costs ~1.3s, "
-                         "so this can be small -- it no longer gates a full "
+    ap.add_argument("--interval", type=int, default=10,
+                    help="seconds between cascade ticks (default 10, the "
+                         "settled demo cadence). Stage 0 costs ~1.3s, so this "
+                         "can be small -- it no longer gates a full "
                          "investigation")
     ap.add_argument("--json", help="write final session state here")
     ap.add_argument("--timeout", type=float, default=None,

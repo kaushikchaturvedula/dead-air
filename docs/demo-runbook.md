@@ -71,9 +71,10 @@ not the shot you want either.
 make agent-sweep INTERVAL=10
 ```
 
-**Always pass `INTERVAL` explicitly.** A bare `make agent-sweep` defaults to
-**300s** — a five-minute tick, which would silently make detection look terrible
-on camera.
+`INTERVAL=10` is now the **default**, so a bare `make agent-sweep` gives the
+demo cadence. It used to default to 300s — a five-minute tick that would have
+silently made detection look terrible on camera. Pass `INTERVAL` only to
+override.
 
 Then wait before cutting to the dashboard. Two things have to happen, and only
 the first is visible in T2:

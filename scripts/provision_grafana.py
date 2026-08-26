@@ -28,6 +28,12 @@ import urllib.request
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_PATH = os.path.join(REPO, "agents", "grafana_probe", ".env")
 
+# The staleness budget is defined by the PUBLISHER of these metrics, so it is
+# imported rather than restated -- the panel query below and the sweep's own
+# self-report have to agree, and a copy is how they stop agreeing.
+sys.path.insert(0, os.path.join(REPO, "agents"))
+from dead_air.content_metrics import CONTENT_STALE_AFTER_SECONDS  # noqa: E402
+
 FOLDER_UID = "deadair"
 FOLDER_TITLE = "DEAD AIR"
 DASHBOARD_UID = "deadair-plant"
@@ -123,30 +129,6 @@ CANARY_PANEL_IDS = [1, 2, 3]
 # 40 sits in a 100-unit empty gap -- see docs/content-screen.md.
 CONTENT_LUMA_THRESHOLD = 40
 
-# How old the newest Stage 0 sample may be before the content panels stop
-# claiming to know anything.
-#
-# WHY THIS EXISTS. Prometheus keeps serving a series' last value for ~5 minutes
-# after samples stop. The content metrics are PUSHED by the agent's Stage 0
-# screen, so when the sweep is not running there are no samples -- and for those
-# five minutes `max(deadair_content_suspect)` keeps returning the last value.
-# Measured: 72 seconds after the final sample, with nothing watching at all, the
-# naive query still returned 0 and the panel still rendered a green "PICTURE
-# OK". The one panel carrying the entire thesis would sit there reassuring the
-# operator over a black stream, for the same reason the rest of the dashboard
-# does. A dashboard that lies toward "fine" is the exact failure this project
-# exists to attack, so it must not be committed by our own panel.
-#
-# 90s is nine missed ticks at the demo's `INTERVAL=10` (docs/demo-runbook.md).
-# It is deliberately coupled to the sweep interval: run the sweep slower than
-# ~45s and the panels will correctly, and permanently, report NOT WATCHING.
-#
-# The budget is only safe because the sweep keeps screening THROUGH an
-# investigation, on a thread (_ContentMonitor in scripts/run_agent.py). Without
-# that the loop blocks for ~209s and the panel would go stale mid-incident --
-# which is why the fix was a background screen rather than simply raising this
-# number above the run ceiling.
-CONTENT_STALE_AFTER_SECONDS = 90
 
 # Absence must be representable, so it gets its own value rather than being
 # folded into 0 (healthy) or dropped (Grafana renders empty as "No data", which

@@ -194,8 +194,8 @@ agent-watch: ## Wake the agent on every firing alert from the webhook receiver
 	@$(PY) scripts/run_agent.py --watch 2>&1 \
 	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
 
-agent-sweep: ## Confidence monitor: proactive sweep on a timer (finds black_source)
-	@$(PY) -u scripts/run_agent.py --sweep --interval $(or $(INTERVAL),300) \
+agent-sweep: ## Confidence monitor: proactive sweep (INTERVAL=10s default, finds black_source)
+	@$(PY) -u scripts/run_agent.py --sweep --interval $(or $(INTERVAL),10) \
 	  --region $(or $(REGION),us-east1) 2>&1 \
 	  | grep -v "Warning\|check_feature\|mTLS\|session = await"
 

@@ -57,6 +57,28 @@ logger = logging.getLogger("deadair.content_metrics")
 # WATCHING. It must never be 0: zero is a measured healthy picture.
 UNKNOWN = -1
 
+# How old the newest sample may be before a reader should stop believing it.
+#
+# THIS LIVES HERE, WITH THE PUBLISHER, because it is a property of the
+# publishing contract -- how often these gauges are written -- not of any one
+# reader. It has exactly two consumers and they must never disagree:
+#
+#   scripts/provision_grafana.py  builds the panel query that ENFORCES it
+#   scripts/run_agent.py          self-reports whether the budget was MET
+#
+# It was previously defined in provision_grafana and restated as a bare `90` in
+# run_agent's report(), twice, under a comment naming the constant it was
+# copying. Both were 90, so behaviour was right -- but that is the same drift
+# shape as the two genai clients before RETRY was shared, and here it would be
+# worse: the restatement is inside the line that reports WHETHER the panel went
+# stale, so a divergence would make the self-check lie about the one thing it
+# exists to check.
+#
+# The value is coupled to the sweep interval: 90s is nine missed ticks at the
+# demo's INTERVAL=10. Run the sweep slower than ~45s and readers will
+# correctly, and permanently, report NOT WATCHING.
+CONTENT_STALE_AFTER_SECONDS = 90
+
 _lock = threading.Lock()
 _installed = False
 _gauges = None
