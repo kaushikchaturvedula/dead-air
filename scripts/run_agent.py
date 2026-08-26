@@ -31,6 +31,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 
@@ -280,6 +281,12 @@ def sweep(interval, region, timeout=None, approval_mode="deny",
               f"dark_frames={m.get('dark_frame_fraction')}) in {dt:.2f}s",
               flush=True)
 
+        # The monitor starts BEFORE Stage 1, not after. Vision is bounded at
+        # 150s, and the last Stage 0 publish was already ~1.3s ago, so leaving
+        # Stage 1 uncovered risks the panel going stale at the escalation beat.
+        monitor = _ContentMonitor(region, rendition, interval)
+        monitor.__enter__()
+
         # Stage 1: vision confirms WHAT is wrong before waking five phases.
         t1 = time.monotonic()
         seen = inspect_frame(region, rendition)
@@ -290,6 +297,7 @@ def sweep(interval, region, timeout=None, approval_mode="deny",
               f"{seen.get('timecode_value')}) in {v_dt:.1f}s", flush=True)
 
         if verdict == "healthy":
+            monitor.__exit__(None, None, None)
             print(f"  tick {ticks}: vision disagrees with the screen; not "
                   f"escalating\n", flush=True)
             time.sleep(interval)
@@ -312,12 +320,161 @@ def sweep(interval, region, timeout=None, approval_mode="deny",
             "approval_mode": approval_mode,
             "stage0_screen": json.dumps(screen),
         }
+        # The investigation blocks this loop; the monitor (already running,
+        # started before Stage 1) keeps the content panel fed throughout.
+        final = None
         try:
             final = asyncio.run(run_once(state, timeout=timeout))
-            show(final)
         except Exception as e:
             print(f"  sweep error: {type(e).__name__}: {e}", flush=True)
+        finally:
+            monitor.__exit__(None, None, None)
+        if final is not None:
+            show(final)
+        print(f"  {monitor.report()}\n", flush=True)
         time.sleep(interval)
+
+
+class _ContentMonitor:
+    """Keep Stage 0 publishing while a Stage 2 investigation blocks the loop.
+
+    THE PROBLEM. The sweep is strictly serial: when Stage 0 flags, Stage 1 and
+    then the whole five-phase investigation run inline, and the loop cannot
+    reach the next screen until they return -- typically 209s, up to the 750s
+    demo ceiling. No screens means no deadair_content_* samples, and the panels
+    go stale at CONTENT_STALE_AFTER_SECONDS (90s). So roughly ninety seconds
+    into every investigation the panel carrying the thesis flipped from a red
+    DEAD AIR to an orange NOT WATCHING -- during the exact shot where the
+    narration is "content red, delivery green". The inverse of the staleness
+    bug the 90s budget was added to fix.
+
+    WHY A BACKGROUND SCREEN RATHER THAN THE ALTERNATIVES.
+
+      A heartbeat republishing the last verdict would hold the panel red, but
+      it would be asserting a measurement it did not take. If the plant changed
+      during those 209s the panel would state something false, and "measure,
+      do not assume" is the entire thesis. It also cannot report a fault that
+      STARTS during an investigation.
+
+      Raising the staleness budget is the worst option available. To cover the
+      750s demo ceiling it would have to exceed 750s, and to cover the 900s
+      hard ceiling, 900s -- which reinstates the original bug at ten times the
+      duration: a panel free to show a stale green for a quarter of an hour
+      after the sweep has died. The 90s budget exists precisely to stop that.
+
+      Screening on a thread publishes REAL readings throughout, so the budget
+      keeps both its value and its meaning. It is also what a confidence
+      monitor actually is: broadcast operations do not stop watching the output
+      because someone is investigating it.
+
+    LONG RUNS. This is duration-independent. Whether the investigation takes
+    209s, hits the 750s demo ceiling or the 900s hard ceiling, samples keep
+    flowing at the sweep interval and the panel never goes stale. Nothing here
+    needs to know how long the run will be, which is the property the other two
+    mechanisms lack.
+
+    The thread is a daemon and every screen is wrapped: a failure to monitor
+    must never take down the investigation it is monitoring.
+    """
+
+    def __init__(self, region, rendition, interval):
+        self.region = region
+        self.rendition = rendition
+        # Clamped at BOTH ends. The floor stops us hammering the edge; the
+        # ceiling matters more -- `make agent-sweep` with no INTERVAL passes
+        # 300, and _stop.wait(300) would never return during a 169-245s
+        # investigation, so the monitor would publish nothing and then report
+        # that it had.
+        self.interval = max(5, min(int(interval), 30))
+        self.ticks = 0
+        self.errors = 0
+        self.max_gap = 0.0
+        self._last_publish = None
+        self._last_reason = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        self._last_publish = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run, name="deadair-content-monitor", daemon=True)
+        self._thread.start()
+        return self
+
+    def _screen_once(self):
+        """One screen, recording whether it actually produced a reading."""
+        try:
+            v = screen_live_segment(self.region, self.rendition)
+        except Exception as exc:                        # noqa: BLE001
+            self.errors += 1
+            print(f"    [monitor] screen raised: {type(exc).__name__}: "
+                  f"{str(exc)[:80]}", flush=True)
+            return None
+        # screen_live_segment CATCHES its own failures and returns
+        # reason="error" rather than raising, so counting only exceptions would
+        # report errors=0 on a monitor whose every screen failed.
+        if v.get("reason") == "error":
+            self.errors += 1
+            print(f"    [monitor] screen error: {str(v.get('error'))[:80]}",
+                  flush=True)
+            return v
+        now = time.monotonic()
+        if self._last_publish is not None:
+            self.max_gap = max(self.max_gap, now - self._last_publish)
+        self._last_publish = now
+        self.ticks += 1
+        return v
+
+    def _run(self):
+        # Screen ONCE immediately. Waiting first leaves the interval plus
+        # however long Stage 1 took uncovered, and Stage 1 is bounded at 150s,
+        # not 5.4s -- a slow vision call would flip the panel at exactly the
+        # escalation beat.
+        v = self._screen_once()
+        if v is not None:
+            self._last_reason = v.get("reason")
+        # wait() returns True only when stop is set, so this both paces the
+        # loop and exits promptly on teardown.
+        while not self._stop.wait(self.interval):
+            v = self._screen_once()
+            if v is None:
+                continue
+            reason = v.get("reason")
+            # Print only on a CHANGE. A line per tick would bury the agent's
+            # own output, and the panel is the evidence here, not the terminal.
+            if reason != self._last_reason:
+                yavg = (v.get("measurements") or {}).get("yavg_mean")
+                print(f"    [monitor] content now {reason!r} (yavg={yavg}) "
+                      f"-- panel stays live during the investigation",
+                      flush=True)
+                self._last_reason = reason
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        if self._thread is not None:
+            # Short join: a screen in flight can take up to ~60s (ffmpeg's own
+            # timeout), and holding the terminal that long on teardown reads as
+            # a hang -- especially on Ctrl-C, which reaches here as a
+            # BaseException while __exit__ still runs.
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                print("    [monitor] a screen was still in flight at teardown; "
+                      "it will publish once more and exit", flush=True)
+        return False                     # never swallow the run's exception
+
+    def report(self):
+        """What actually happened -- measured, not asserted."""
+        if self.ticks == 0:
+            return (f"content monitor published NOTHING during the "
+                    f"investigation ({self.errors} failed) -- THE PANEL WENT "
+                    f"STALE")
+        stale = self.max_gap > 90        # CONTENT_STALE_AFTER_SECONDS
+        msg = (f"content monitor published {self.ticks} screen(s) during the "
+               f"investigation, largest gap {self.max_gap:.0f}s")
+        if self.errors:
+            msg += f", {self.errors} failed"
+        return msg + (" -- EXCEEDED the 90s staleness budget" if stale
+                      else " -- panel stayed live")
 
 
 def _legacy_sweep(interval, region, timeout=None, approval_mode="deny"):

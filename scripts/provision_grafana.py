@@ -137,15 +137,45 @@ CONTENT_LUMA_THRESHOLD = 40
 # does. A dashboard that lies toward "fine" is the exact failure this project
 # exists to attack, so it must not be committed by our own panel.
 #
-# 90s is three missed ticks at the demo's `INTERVAL=30`. It is deliberately
-# coupled to the sweep interval: run the sweep slower than ~45s and the panels
-# will correctly, and permanently, report NOT WATCHING.
+# 90s is nine missed ticks at the demo's `INTERVAL=10` (docs/demo-runbook.md).
+# It is deliberately coupled to the sweep interval: run the sweep slower than
+# ~45s and the panels will correctly, and permanently, report NOT WATCHING.
+#
+# The budget is only safe because the sweep keeps screening THROUGH an
+# investigation, on a thread (_ContentMonitor in scripts/run_agent.py). Without
+# that the loop blocks for ~209s and the panel would go stale mid-incident --
+# which is why the fix was a background screen rather than simply raising this
+# number above the run ceiling.
 CONTENT_STALE_AFTER_SECONDS = 90
 
 # Absence must be representable, so it gets its own value rather than being
 # folded into 0 (healthy) or dropped (Grafana renders empty as "No data", which
 # a stat panel still paints with the BASE threshold colour -- green).
 CONTENT_UNKNOWN = -1
+
+# The series the confidence monitor actually sweeps, and the ONLY one these
+# panels read.
+#
+# WHY PINNED. Phase 5's verify_visual_recovery screens
+# `_affected_regions_from_state()[0]` (act_tools.py) -- a region taken from the
+# MODEL-authored affected_regions list. For black_source, an encoder fault
+# feeding all three edges, the model lists all three, so that region is
+# frequently NOT the one being swept. Phase 5 then publishes
+# deadair_content_suspect=1 for it exactly once and never again.
+#
+# Unpinned, `max(deadair_content_suspect)` aggregates across every series, and
+# the freshness gate is all-or-nothing (`unless on()` against the newest sample
+# ACROSS all series), so the monitor keeping us-east1 fresh means the gate can
+# never trip on the ghost. Between takes -- sweep killed, chaos cleared, plant
+# healthy -- a fresh us-east1=0 plus a stale europe-west1=1 gives max()=1 and
+# the panel reads a full-background red DEAD AIR over a healthy plant for the
+# ~5 minutes of Prometheus's lookback. That is indistinguishable from a real
+# fault, and because it depends on the model's list order it would not
+# reproduce reliably in rehearsal.
+CONTENT_PANEL_REGION = os.environ.get("DEADAIR_DEMO_REGION", "us-east1")
+CONTENT_PANEL_RENDITION = os.environ.get("DEADAIR_DEMO_RENDITION", "1080p")
+_SWEPT = (f'{{region="{CONTENT_PANEL_REGION}", '
+          f'rendition="{CONTENT_PANEL_RENDITION}"}}')
 
 
 def _fresh(expr, metric):
@@ -236,9 +266,9 @@ def dashboard_model():
                 # Gated, it breaks into a visible gap instead (spanNulls is
                 # false below, so the gap is drawn as a gap).
                 "targets": [target(
-                    "deadair_content_luma_avg unless on() "
-                    "(time() - max(timestamp(deadair_content_luma_avg)) > "
-                    f"{CONTENT_STALE_AFTER_SECONDS})",
+                    f"deadair_content_luma_avg{_SWEPT} unless on() "
+                    f"(time() - max(timestamp(deadair_content_luma_avg{_SWEPT}))"
+                    f" > {CONTENT_STALE_AFTER_SECONDS})",
                     "{{region}} / {{rendition}}")],
                 "fieldConfig": {
                     "defaults": {
@@ -274,8 +304,8 @@ def dashboard_model():
                 "gridPos": {"h": 9, "w": 6, "x": 12, "y": 1},
                 "datasource": {"type": "prometheus", "uid": DATASOURCE_UID},
                 "targets": [target(
-                    _fresh("max(deadair_content_suspect)",
-                           "deadair_content_suspect"), "content")],
+                    _fresh(f"max(deadair_content_suspect{_SWEPT})",
+                           f"deadair_content_suspect{_SWEPT}"), "content")],
                 "fieldConfig": {
                     "defaults": {
                         "color": {"mode": "thresholds"},

@@ -117,6 +117,18 @@ If you want a second beat, use `ladder_collapse` — the only other fault with a
 visible player symptom (quality drops), and it demonstrates the 404-persistence
 discriminator. Do not attempt three.
 
+During Stage 2 the sweep keeps screening on a background thread, so the content
+panel stays live for the whole investigation. You will see one extra line in T2
+when the verdict first changes, and a summary when the investigation ends:
+
+```
+    [monitor] content now 'black' (yavg=17.08) -- panel stays live during the investigation
+    content monitor published 28 screen(s) during the investigation, largest gap 13s -- panel stayed live
+```
+
+That summary is measured, not asserted: if the largest gap ever exceeds the 90s
+budget it says so instead.
+
 | t | you do | what the viewer sees | measured |
 | --- | --- | --- | --- |
 | 0:00 | — | player sharp, timecode ticking. Dashboard all green. T2: `tick N: clear (yavg=125.6 in 1.3s)` | 1.3s/tick |
@@ -234,7 +246,8 @@ is the single most likely thing to trip you up, because everything *looks* ready
 
 | symptom | check |
 | --- | --- |
-| content panel orange / NOT WATCHING | is `make agent-sweep` still alive in T2? |
+| content panel orange / NOT WATCHING | is `make agent-sweep` still alive in T2? Check the monitor summary line for the largest gap. |
+| panel red on a healthy plant between takes | should not happen: the panels are pinned to the swept region. If it does, a stale series is in Prometheus's ~5min lookback -- wait it out or re-run `make provision`. |
 | content panel empty, "No data" | sweep never started, or started under 90s ago |
 | T2 silent after `STAGE 0 SUSPECT` | vision is slow — bounded at 150s, returns `vision_unavailable` rather than hanging |
 | dashboard panels all "No data" | `make verify` in T1 — config or credentials, not the plant |

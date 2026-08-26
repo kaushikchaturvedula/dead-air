@@ -52,6 +52,11 @@ _SERVICE = os.environ.get("OTEL_SERVICE_NAME", "deadair-agent")
 
 logger = logging.getLogger("deadair.content_metrics")
 
+# The sentinel for "we do not currently know", kept in step with
+# CONTENT_UNKNOWN in scripts/provision_grafana.py, which maps it to NOT
+# WATCHING. It must never be 0: zero is a measured healthy picture.
+UNKNOWN = -1
+
 _lock = threading.Lock()
 _installed = False
 _gauges = None
@@ -178,7 +183,23 @@ def record_screen(verdict: dict, region: str, rendition: str,
         # Skip the picture gauges entirely and let the series go stale, which
         # is the honest representation of "we did not get a look".
         if verdict.get("reason") == "error":
-            gauges["suspect"].set(0, attrs)
+            # UNKNOWN, NOT ZERO. Zero is the value for "we looked and the
+            # picture is fine", and a screen that failed is not an observation
+            # about the picture at all -- it is the absence of one. Publishing
+            # 0 here rendered a green PICTURE OK on the panel that carries the
+            # whole thesis, from a failed segment fetch.
+            #
+            # That was latent while screening only happened between
+            # investigations; it became reachable mid-shot the moment the
+            # content monitor started screening DURING one, where a single
+            # transient fetch error would have flipped the panel from red to
+            # green in front of the camera.
+            #
+            # -1 matches CONTENT_UNKNOWN in scripts/provision_grafana.py, which
+            # the stat panel maps to NOT WATCHING and colours from the orange
+            # base step. Luma and the rest are deliberately NOT published, so
+            # the timeseries breaks into a gap rather than flat-lining.
+            gauges["suspect"].set(UNKNOWN, attrs)
             if duration_seconds is not None:
                 gauges["screen_seconds"].set(round(duration_seconds, 3), attrs)
             _flush(flush)
