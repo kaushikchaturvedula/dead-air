@@ -1,140 +1,265 @@
-# DEAD AIR
+<div align="center">
 
-**An autonomous broadcast operations agent for live video streaming.**
+# 📺 DEAD AIR
 
-> An active build for the Google Cloud "Agentic Cinema" hackathon (Grafana
-> track, due 7 Sep 2026).
+### Autonomous Broadcast Operations Agent for Live Video
+
+**An agent that watches live video the way a broadcast engineer does — by looking at the picture — and catches the failures delivery telemetry is structurally blind to.**
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Agent](https://img.shields.io/badge/agent-Google%20ADK-4285F4.svg)](https://google.github.io/adk-docs/)
+[![Model](https://img.shields.io/badge/model-Gemini%20via%20Vertex%20AI-7C3AED.svg)](https://cloud.google.com/vertex-ai)
+[![Observability](https://img.shields.io/badge/Grafana-Mimir%20·%20Loki%20·%20Tempo-F46800.svg)](https://grafana.com/)
+[![Accuracy](https://img.shields.io/badge/diagnostic%20accuracy-6%2F6-22C55E.svg)](docs/agent.md)
+
+</div>
+
+---
+
+## The problem
+
+**Delivery telemetry measures whether *bytes* arrived. It cannot see whether those bytes contain a *picture*.**
+
+When an encoder's input goes black, or its source freezes on one frame, the segments keep flowing on schedule. Bitrate is nominal. Segment latency is flat. Error rates are zero. **Every panel is green — and every viewer is staring at a black rectangle.**
+
+This is not a hypothetical gap. It is the documented behaviour of the broadcast chain:
+
+> "Processing equipment within the broadcast chain may choose to freeze on the last active image or go to a black image when a signal is lost. **The transmission system considers this image as an active signal and may not alert the operator to the fault within the system.**"
 >
-> **Working end to end, locally:** the full streaming plant (encoder → 3
-> regional edges → 201-session viewer fleet), all five of the brief's fault
-> modes, all three observability signals (Mimir · Loki · Tempo), and **all five
-> agent phases** — scope, see, diagnose, human-gated act, and record with
-> verified recovery.
+> — Tektronix, [*Black and Frozen Frame Detection*](https://download.tek.com/document/2PW-24654-0.pdf) (WFM/WVR waveform monitors)
+
+Modern streaming monitoring inherits the same blind spot, because it watches the transport:
+
+> "A stream may start successfully, report normal bitrate, and show no errors in monitoring tools, **while the viewer is stuck on a black screen with no way to recover.**"
 >
-> **Measured:** 6/6 correct across all five faults plus a healthy control,
-> through the complete five-phase agent. 69/69 on the content screen's
-> calibration corpus, 100% detection and 0% false positives. Black frame on air
-> to a classified fault in **~18s** at a 10-second sweep; full closure with
-> verified recovery in 3.1–4.4 minutes. The delivery-telemetry baseline for that
-> fault is not slower — it is **never**: no threshold is crossed, so no alert
-> can fire.
->
-> **Cloud:** steps 1 and 2 executed and measured, then torn down —
-> [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md). The viewer
-> fleet has not yet moved into GCP, which that document explains is a
-> correctness prerequisite for any regional fault demo, not polish.
+> — Witbe, [*Why QoS video monitoring fails to reflect real user experience at scale*](https://www.witbe.net/articles/why-video-quality-monitoring-fails-user-experience/)
 
-## The thesis: every dashboard is green and the screen is black
+And the clock is expensive while nobody notices. New Relic's *State of Observability for Media and Entertainment* reports that **high-impact outages cost media companies an average of $2 million per hour**, and take **around 40 minutes to resolve** ([press release, Oct 2025](https://newrelic.com/press-release/20251028) — vendor survey of engineering leaders, self-reported).
 
-Delivery telemetry measures whether *bytes* arrived. It cannot see whether those
-bytes contain a *picture*.
+### Measured, on this plant
 
-When an encoder's input goes black, or its source freezes on a single frame, the
-segments keep flowing on schedule. Bitrate is nominal. Segment latency is flat.
-Error rates are zero. Every panel in the dashboard is green — and every viewer is
-staring at a black rectangle. Conventional observability is structurally blind to
-this class of failure, because the failure is in the content, not the transport.
+DEAD AIR ships with the broadcast plant it observes, so the premise is demonstrated rather than asserted. Inject a source blackout and every delivery signal holds:
 
-DEAD AIR closes that gap. It correlates delivery telemetry with the actual
-delivered pixels, so a healthy-looking pipeline carrying dead air gets caught.
+| Signal | Under a total blackout | |
+| --- | --- | --- |
+| `encoder_fps` | 30.0 | unchanged |
+| `dropped_frames` | 0 | unchanged |
+| `packager_segment_lag` | normal sawtooth | unchanged |
+| Edge cache hit ratio | ~98% | unchanged |
+| `rebuffer_ratio` | **~0.0002** against a **0.02** alert threshold | ~100× below the line |
+| **Alert state after 10 minutes of black** | **`Normal`, all three regions** | **zero webhooks fired** |
 
-## How it works
+There is no delivery-telemetry baseline to beat for this fault class. **No threshold is crossed, so no alert can ever fire.** An alert-driven agent sleeps through it forever. The honest comparison is not *faster detection* — it is *detection at all*.
 
-When viewer quality-of-experience degrades, a [Google ADK](https://google.github.io/adk-docs/)
-agent powered by Gemini:
+---
 
-1. **Queries Grafana Cloud** through a self-hosted [Grafana MCP
-   server](https://github.com/grafana/mcp-grafana), across metrics, logs, and
-   traces.
-2. **Pulls the actual video segment** being delivered to viewers.
-3. **Inspects the frame with Gemini vision** — catching black frames, frozen
-   sources, and other content failures that delivery telemetry reports as
-   perfectly healthy.
-4. **Proposes a remediation**, gated on human approval. Nothing acts on the
-   plant without a person saying yes.
-5. **Re-queries to verify recovery**, then **annotates the Grafana dashboard**
-   with a postmortem.
+## The product
 
-## Architecture
+DEAD AIR runs a **confidence monitor**: it continuously pulls the actual HLS segment being served to viewers and screens the pixels, exactly as a broadcast operations desk watches a confidence feed. When something looks wrong it:
 
-The whole system — plant layers, both triggers, the three-stage cascade, the
-five phases and the reflexive loop — is one diagram in
-**[docs/architecture.md](docs/architecture.md)**, along with the list of what is
-decided by code rather than by the model.
+- **Scopes** the incident across metrics, logs and traces — four specialists querying Grafana Cloud concurrently through a self-hosted Grafana MCP server.
+- **Sees** the frame — fetches the real segment from the affected edge and classifies the picture, reading the burned-in timecode to tell a *dead source* from a *frozen* one.
+- **Diagnoses** from a deterministic evidence checklist. Gemini ranks which hypotheses are worth testing; **code runs the confirming checks and computes the verdict.**
+- **Proposes** exactly one remediation from a fixed table, and **stops for human approval** — enforced by a token only a person can issue, not by a prompt.
+- **Verifies recovery** with the check that fault class actually requires, then annotates the Grafana dashboard and files a postmortem.
 
-The short version:
+It is also **an observable service in its own right**: its traces, token counts and estimated cost land in the same Grafana stack it investigates.
 
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    subgraph PLANT["① SIMULATED PLANT"]
+        direction TB
+        L1["<b>L1</b> encoder + origin<br/>4-rung ABR, burned-in timecode"]
+        L2["<b>L2</b> 3 CDN edges"]
+        L3["<b>L3</b> 201 viewers, real ABR"]
+        L1 --> L2 --> L3
+    end
+
+    subgraph GC["② GRAFANA CLOUD"]
+        direction TB
+        MIMIR[("Mimir · metrics")]
+        LOKI[("Loki · logs")]
+        TEMPO[("Tempo · traces")]
+    end
+
+    subgraph TRIG["③ TWO TRIGGERS"]
+        direction TB
+        ALERT["<b>A · ALERT</b><br/>rebuffer_ratio > 0.02<br/><i>delivery faults</i>"]
+        SWEEP["<b>B · SWEEP</b><br/>every 10s, unconditional<br/><i>content faults — no alert exists</i>"]
+    end
+
+    subgraph CASCADE["④ CASCADE"]
+        direction TB
+        S0["<b>Stage 0</b><br/>ffmpeg signalstats<br/>~1.3s · NO MODEL"]
+        S1["<b>Stage 1</b><br/>Gemini vision ~5.4s<br/>what KIND of wrong"]
+        CLEAR(["clear →<br/>next tick<br/>0 model calls"])
+        S0 -->|suspect| S1
+        S0 -->|clear| CLEAR
+    end
+
+    subgraph PIPE["⑤ FIVE PHASES (Google ADK)"]
+        direction TB
+        P1["<b>1 SCOPE</b><br/>4 specialists in parallel"]
+        P2["<b>2 SEE</b><br/>inspect the frame"]
+        P3["<b>3 DIAGNOSE</b><br/>checklist decides"]
+        P4["<b>4 ACT</b><br/>propose ONE fix"]
+        GATE{{"HUMAN APPROVAL<br/>token-gated in code"}}
+        P5["<b>5 RECORD</b><br/>verify · annotate"]
+        P1 --> P2 --> P3 --> P4 --> GATE --> P5
+    end
+
+    PLANT -->|"Alloy · cardinality guard"| GC
+    MIMIR --> ALERT
+    SWEEP --> S0
+    ALERT ==> P1
+    S1 ==>|confirmed| P1
+
+    style S0 fill:#1a4d2e,color:#fff
+    style GATE fill:#7a2020,color:#fff
+    style SWEEP fill:#1a3a5c,color:#fff
 ```
-  L1 encoder ──▶ L2 edges ──▶ L3 viewer fleet
-                     │  metrics · logs · traces (Alloy, cardinality-guarded)
-                     ▼
-              Grafana Cloud ──▶ alert ──┐
-                                        ├──▶  five-phase ADK agent
-  confidence sweep ──▶ Stage 0 screen ──┘      scope · see · diagnose
-   (every 30s)         ~1.3s, no model         act (human-gated) · record
-                            │
-                            └─▶ Stage 1 vision, only when Stage 0 says suspect
-```
 
-Two triggers, because the fault this project is named after **fires no alert**:
-under `black_source`, `rebuffer_ratio` reads ~0.0001 against a 0.02 threshold.
-An alert-driven agent sleeps through it.
+Full diagram and the reflexive loop in **[docs/architecture.md](docs/architecture.md)**.
 
-## Tech stack
+> **Why two triggers, and why a cascade — not a model on every tick?**
+>
+> The sweep is **first-class, not a fallback.** `black_source` moves no metric, so no alert can exist for it; an alert-only agent is architecturally incapable of catching the fault this project is named after. Real broadcast operations run a confidence monitor for exactly this reason.
+>
+> But a model on every tick is unaffordable, and it was: before the cascade, every sweep tick ran a full investigation, so the cadence floor was the pipeline's own runtime and "catches it in seconds" was untrue at any interval. **Deciding whether a frame is black is arithmetic.** Deciding *what kind* of wrong it is, is worth a model. Splitting those is what makes continuous watching cheap enough to actually run — a healthy plant now makes **zero vision calls per hour**.
 
-Google Cloud AI tooling only, by contest rule.
+### What is decided by code, not by the model
 
-| Layer | Choice |
+This is the load-bearing design choice, so it is worth listing exactly:
+
+| Decision | Decided by | Where |
+| --- | --- | --- |
+| Is the picture black | `ffmpeg signalstats` YAVG/YHIGH thresholds | [`content_screen.py`](agents/dead_air/content_screen.py) |
+| Does a rung carry its detail | round-trip PSNR ratio | [`rung_resolution_check.py`](scripts/rung_resolution_check.py) |
+| Which fault the evidence supports | fixed predicates over collected evidence | [`signatures.py`](agents/dead_air/signatures.py) |
+| Which remediation to propose | fixed fault→action table, via a **forced** tool call | [`act_tools.py`](agents/dead_air/act_tools.py) |
+| **Whether it may execute** | **a token only a human can issue** | [`act_tools.py`](agents/dead_air/act_tools.py) |
+| Which SLO verifies recovery | fault class, dispatched in code | [`act_tools.py`](agents/dead_air/act_tools.py) |
+| Viewer impact | arithmetic over a measured window | [`act_tools.py`](agents/dead_air/act_tools.py) |
+
+The model ranks hypotheses, explains, and writes for humans. **Evidence decides.** Where the two disagree, the disagreement is recorded rather than resolved silently — and a fault whose required checks cannot be evaluated comes back **`unconfirmable`, never `ruled_out`**, because missing evidence must never masquerade as elimination.
+
+---
+
+## The plant
+
+DEAD AIR ships with the streaming system it observes — there is no point building a detector with nothing to detect. Four layers, all in Docker:
+
+| Layer | What | Exports |
+| --- | --- | --- |
+| **L1** | ffmpeg encoder → nginx origin. 4-rung ABR HLS ladder (1080p/5M · 720p/3M · 480p/1.5M · 360p/800k, 4s segments) with **burned-in timecode** | `encoder_fps`, `dropped_frames`, `packager_segment_lag`; access logs → Loki |
+| **L2** | 3 caching edges standing in for `us-east1`, `europe-west1`, `asia-south1` | cache hit ratio, segment status, TTFB histograms, per-region fault injection |
+| **L3** | 201 modeled viewer sessions on a real playback clock with ABR and per-device buffers | `rebuffer_ratio` — a client-side signal no CDN metric can produce |
+| **L0** | a synthetic canary, deliberately unrelated to video | answers "is the PLANT broken, or the PIPE?" |
+
+The burned-in timecode is load-bearing, not decoration: **a running clock over a black picture means the encoder is alive and the SOURCE is dead; a stopped clock means the source froze.** That one field separates two faults that are otherwise pixel-identical.
+
+**Cardinality is guarded at the collector.** A streaming plant is the classic way to blow a metrics budget — one series per viewer, per request, or per 4-second segment. Per-session detail goes to Loki in the log *line*, never as a label. Whole plant: **172 active series** against a ~10k free-tier budget, proven in both directions by deliberate canaries.
+
+### The fault menu
+
+Five faults, each with a measured signature — the answer key the agent is graded against:
+
+| Fault | rebuffer | bitrate | 4xx | The tell |
+| --- | --- | --- | --- | --- |
+| `edge_latency` | 0.44, **one region** | drops, that region | none | regional, not plant-wide |
+| `segment_gap` | ~0.05, all regions | unchanged | **sustained** | packager fault |
+| `ladder_collapse` | zero | 3.6 → 2.0 Mbps | **transient, then stops** | manifest drops 4 → 3 rungs |
+| `black_source` | **zero** | unchanged | none | **nothing moves** |
+| `ladder_mismatch` | **zero** | unchanged | none | **nothing moves** |
+
+The bottom two are invisible in every metric, log and trace — and that is the point. `ladder_collapse` and `segment_gap` both produce 404s, so **presence** of 404s separates nothing; **persistence** does, and the discriminator compares a recent window against an earlier one.
+
+---
+
+## Measured results
+
+Every figure below is measured on the running plant and traceable to a doc in this repo.
+
+| | |
 | --- | --- |
-| Agent framework | Google ADK (`google-adk`) |
-| Model | Gemini via Vertex AI (`google-genai`) |
-| Observability | Grafana Cloud |
-| MCP server | [grafana/mcp-grafana](https://github.com/grafana/mcp-grafana), self-hosted via Docker |
-| Tool transport | MCP over streamable HTTP |
+| **Diagnostic accuracy** | **6/6** — all five faults plus a healthy control, through the complete five-phase agent |
+| **Content screen calibration** | **69/69**, 100% detection, **0% false positives** (6 states × 4 ladder rungs) |
+| **Luma separation** | black 17.05–17.12 vs healthy 125.47–125.62 — threshold at 40 sits in a ~100-unit empty gap |
+| **Stage 0 cost** | 1.22 / 1.29 / 1.41s (min/median/max), **zero model calls** |
+| **Black on air → flagged** | **12.4 / 12.5 / 12.4s** (n=3, 10s sweep) |
+| **→ classified fault** | **~18s** |
+| **→ full closure, verified recovery** | **3.1 – 4.4 min** |
+| **Plant's own floor** | 6.4 – 8.1s — encoder finishing a 4s segment, origin, edge. No detector beats it. |
+| **Cost per investigation** | **$0.21** mean (from $1.38 before the context fix) |
 
-No LangChain, no LangGraph, no non-Google agent framework, and no OpenAI,
-Anthropic, HuggingFace, or Whisper models anywhere in the project.
+### The vision spike that changed the architecture
 
-The MCP server is self-hosted rather than Grafana's hosted `mcp.grafana.com`
-endpoint deliberately: the hosted endpoint only authenticates through an
-interactive OAuth 2.1 browser handshake, which a headless agent woken by an
-alert webhook can never complete. Self-hosting authenticates with a Grafana
-service-account token instead.
+Before building the SEE phase, vision was run against every fault, on every model tier, in three prompt variants. The result **reshaped the design**:
 
-## Setup
+| Fault | Vision verdict | Who decides |
+| --- | --- | --- |
+| `black_source` | **detected, 100%, every model and every variant** | vision |
+| `ladder_mismatch` | **not detected by any configuration** | **code** |
+| `ladder_collapse` / `segment_gap` / `edge_latency` | correctly read as healthy pixels | telemetry |
 
-Requires Python 3.10+, Docker, **ffmpeg on the host**, and a Google Cloud
-project with Vertex AI enabled.
+`gemini-2.5-pro` scored 3/3 on mismatched rungs — and **0/3 on healthy ones**. It answers "upscaled" to everything. That is not detection, it is a constant prior, and it would fire a false source alarm on a healthy stream every time it looked. So **resolution is decided by a round-trip PSNR measurement in code, and vision is never asked** — the enum a model can emit has no "upscaled" option at all, because offering it is what invites the confabulation.
 
-`ffmpeg` is not optional and is not supplied by the venv or by Docker Desktop:
-the Stage 0 content screen, the frame grabs and the rung-resolution measurement
-all shell out to it on the host. Stock macOS and Ubuntu do not ship it.
+### Making continuous watching affordable
 
-```bash
-brew install ffmpeg          # macOS
-sudo apt install ffmpeg      # Debian / Ubuntu
-ffmpeg -version              # must print a version
+Profiling the agent **through its own traces in Tempo** showed every call after Phase 1 carrying ~200k input tokens — 4.3M input against 17k output, a 250:1 ratio. The cause was not context: ADK's per-agent branch isolation only applies downward from a `ParallelAgent`, so every phase under the sequential spine inherited all four specialists' raw tool payloads. **Nothing downstream read them.**
+
+| | input tokens | wall clock | cost |
+| --- | --- | --- | --- |
+| `ladder_collapse` | 4,329,077 → **919,973** (−78.7%) | 362.2s → **187.1s** (−48.3%) | $1.34 → **$0.32** |
+| `segment_gap` | 4,573,692 → **555,140** (−87.9%) | 568.9s → **243.8s** (−57.1%) | $1.42 → **$0.20** |
+
+Output tokens barely moved. The agent does the same work and says the same things — it was carrying freight, not context.
+
+---
+
+## Repository layout
+
+```
+agents/dead_air/    the five-phase agent — scope · see · diagnose · act · record
+                    signatures.py (the deterministic checklist) · content_screen.py (Stage 0)
+                    observability.py (the reflexive layer) · schemas.py (validated outputs)
+agents/grafana_probe/  day-one MCP connectivity probe, kept as honest history
+plant/              the streaming system under observation
+                    encoder · origin · edge ×3 · viewers · emitter · webhook · alloy
+scripts/            run_agent.py (the entry point) · verify_pipe.py (the pipe gate)
+                    diagnose_eval.py · profile_agent_run.py · provision_grafana.py
+docs/               architecture · demo runbook · plant · agent · calibration · audit
+fixtures/frames/    69 committed stills — the content screen's calibration corpus
 ```
 
-```bash
-git clone https://github.com/kaushikchaturvedula/dead-air.git
-cd dead-air
+---
 
-python3 -m venv .venv
-source .venv/bin/activate
+## Quickstart
+
+**Requires** Python 3.10+, Docker, **ffmpeg on the host**, a Google Cloud project with Vertex AI enabled, and a Grafana Cloud stack (free tier is enough).
+
+`ffmpeg` is not optional and is not supplied by the venv or Docker Desktop — the content screen, the frame grabs and the rung measurement all shell out to it. Stock macOS and Ubuntu do not ship it.
+
+```bash
+git clone https://github.com/kaushikchaturvedula/dead-air.git && cd dead-air
+
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+ffmpeg -version                                    # must print a version
 
 cp agents/grafana_probe/.env.example agents/grafana_probe/.env
-# then fill it in. Every key is documented in the example file; `make verify`
-# below fails loudly and by name if any are missing.
-
+# fill it in — every key is documented in the example file, and `make verify`
+# fails loudly and BY NAME if any are missing
 gcloud auth application-default login
 ```
 
 ### See it work
 
-The shortest path from a fresh clone to watching the agent catch dead air.
-**Three terminals**, called T1/T2/T3 here.
+Three terminals — T1, T2, T3.
 
 ```bash
 # ---- T1: bring up the plant ----
@@ -144,19 +269,16 @@ make plant-up          # 20-42s. Blocks until encoder/origin/edges are healthy.
 # has not yet delivered enough to Mimir. Running verify immediately fails at the
 # mimir hop — that is the pipeline being honest, not a broken plant.
 
-make verify            # must print 15/15 PASS before anything below is meaningful
-make provision         # pushes the dashboard + alert rule; prints the dashboard URL
+make verify            # must print 15/15 PASS
+make provision         # dashboard + alert rule; prints the dashboard URL
 ```
 
 ```bash
 # ---- T2: START THIS BEFORE OPENING THE DASHBOARD ----
-make agent-sweep INTERVAL=10
+make agent-sweep       # the confidence monitor, 10s cadence
 ```
 
-The content panels are fed by this sweep. With nothing running there are no
-samples, and Prometheus serves the last value for ~5 minutes — so the panel
-carrying the whole thesis would read green over a black stream. Start the sweep,
-wait for two `clear` ticks, *then* open the dashboard.
+The content panels are fed by this sweep. With nothing running there are no samples, and Prometheus serves the last value for ~5 minutes — so the panel carrying the whole thesis would read green over a black stream. Start the sweep, wait ~40s, *then* open the dashboard.
 
 ```bash
 # ---- browser ----
@@ -167,283 +289,96 @@ make black-source      # the screen goes black; every delivery metric stays gree
 make restore-source    # and back. Give ABR ~120s to settle before a second run.
 ```
 
-Watch T2: Stage 0 flags the black frame in **~12.5s** with no model call at all,
-vision classifies it ~5s later, and the five-phase investigation runs from there.
-The full beat sheet, with measured timings and what to say over each screen, is
-in **[docs/demo-runbook.md](docs/demo-runbook.md)**.
+Watch T2: Stage 0 flags the black frame in **~12.5s** with no model call at all, vision classifies it ~5s later, and the five-phase investigation runs from there.
 
-<details>
-<summary>How this was bootstrapped — the day-one MCP connectivity probe</summary>
-
-Before any of the above existed, the first thing built was a bare ADK agent that
-did nothing but list the Grafana MCP server's tools, to prove a headless agent
-could authenticate at all. It is still in the repo and still works:
+### Everything else
 
 ```bash
-cd agents
-adk web
-```
-
-Open the URL it prints, pick the `grafana_probe` agent, and ask it about your
-stack. The MCP server authenticates with the service-account token — no browser
-handshake involved, which is the whole reason it is self-hosted.
-
-This is a connectivity check, not the product. The tools it exposes are
-catalogued in [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md).
-
-</details>
-
-## The plant
-
-The plant is the streaming system DEAD AIR observes. It is built bottom-up as a
-telemetry pipe first, video second — there is no point rendering pixels into a
-pipe that cannot carry a number.
-
-**Step 1 — telemetry pipe (working).** A synthetic emitter feeds Grafana Alloy,
-which remote-writes to Grafana Cloud Mimir, where a dashboard panel and an alert
-rule watch it. Crossing the threshold turns Grafana red and delivers a webhook
-to a local receiver — the same trigger that will later wake the agent.
-
-```bash
-make plant-up                # emitter + Alloy + webhook receiver + MCP server
-make tunnel                  # (separate shell) expose the webhook publicly
-make provision               # dashboard + alert rule + contact point
-make verify                  # assert every hop of the pipe is delivering
-make set VALUE=95            # cross the threshold -> Grafana goes red
-make watch                   # see the alert delivery arrive
-make set VALUE=10            # back to healthy -> resolved delivery
-```
-
-`make verify` checks each hop in order and stops at the first break, so a
-failure names the broken hop instead of just reporting "no data".
-
-**Cardinality.** The stack is on the Grafana Cloud free tier (~10k active
-series), and a streaming plant is the classic way to blow that budget: one
-series per viewer session, per request, or per 4-second segment multiplies every
-metric by the number of live viewers. The collector strips those labels before
-remote_write ([plant/alloy/config.alloy](plant/alloy/config.alloy)) — aggregate
-the dimension, don't label by it. The emitter publishes a deliberate canary
-series tagged `session_id` so `make verify` proves the guard is still stripping
-rather than merely asserting the label is absent.
-
-**Step 2 — L1 source + encoder (working).** ffmpeg generates a 4-rung ABR HLS
-ladder (1080p/5M · 720p/3M · 480p/1.5M · 360p/800k, 4s segments) with burned-in
-timecode, served by an nginx origin. `encoder_fps`, `dropped_frames` and
-`packager_segment_lag` flow to Mimir; origin access logs flow to Loki.
-
-```bash
-make player     # hls.js player against the local origin
-make ladder     # show the ABR ladder being served
-make frame      # grab the current frame as a PNG
-```
-
-**The demo, runnable now.** Brief §5's headline failure works at L1 already:
-
-```bash
-make black-source     # swap the encoder input to color=black
-make frame            # ...the picture is gone
-make restore-source
-```
-
-With the source black, `encoder_fps` holds 30.0, `dropped_frames` stays 0,
-`encoder_up` stays 1 and segment lag keeps its normal sawtooth. Every delivery
-metric is green while the screen is black — the thesis, on demand, in about
-fifteen seconds.
-
-**Step 3 — L2 CDN edges (working, local).** Three caching reverse proxies
-standing in for `us-east1`, `europe-west1` and `asia-south1`, exporting cache
-hit ratio, segment status, TTFB histograms and origin shield misses — with
-fault injection per region.
-
-```bash
-make edges                                          # per-region state
-make chaos REGION=europe-west1 MODE=edge_latency    # degrade one region
+make diagnose-eval     # drive all 6 cases through the full agent (the 6/6)
+make diagnose-checks   # score the deterministic checklist only — no model, fast
+make screen-calibrate  # reproduce the 69/69 content-screen table
+make agent-profile     # where a run's time went, read from its own traces
+make agent-tools       # which 12 of the 73 MCP tools each specialist sees
+make chaos MODE=<fault> [REGION=...]   # inject any of the five faults
 make chaos-clear
 ```
 
-Measured p95 segment TTFB with one region degraded: **europe-west1 981 ms vs
-us-east1 4.8 ms and asia-south1 4.9 ms** — a ~200× differential in exactly one
-region.
+The full beat sheet — measured timings, what to say over each screen, and what to do when something misfires — is in **[docs/demo-runbook.md](docs/demo-runbook.md)**.
 
-Latency injection is application-level, not `tc netem`, deliberately: netem
-needs `NET_ADMIN`, which Cloud Run does not grant, so a netem-based mechanism
-would have to be rewritten the moment the edges deploy.
+<details>
+<summary><b>How this was bootstrapped</b> — the day-one MCP connectivity probe</summary>
 
-**Step 4 — L3 viewer fleet (working).** 201 modeled sessions on a playback
-clock running `buffer += segment_duration - download_time`, with ABR and
-per-device buffer sizes. This is where `rebuffer_ratio` is born — a client-side
-signal no CDN metric can produce, because only a player knows its buffer
-stalled.
-
-Degrade one region and the fleet reports it, stratified by device:
-
-| Device class | rebuffer_ratio | |
-| --- | --- | --- |
-| mobile | 0.191 | smallest buffer, stalls first |
-| desktop | 0.123 | |
-| tv | 0.048 | largest buffer, most resilient |
-
-All in `europe-west1`; the other two regions stayed at `0.000`. The real alert
-— `rebuffer_ratio > 0.02 for 2m, by region` — fires for that region alone and
-delivers a webhook carrying `region`, which is what the agent will key its
-investigation off.
-
-**The cardinality split, both halves proven.** Metrics aggregate by `region`
-and `device_class` and never by session; per-session QoE beacons go to Loki
-with `session_id` in the log line, never as a label. A canary carrying
-`session_id`, `region` and `device_class` proves the guard strips the first and
-keeps the other two. Whole plant: **172 active series** against a ~10k budget.
-
-**The fault menu (complete).** All five of §5's faults run end to end, each with
-a distinct, measured telemetry signature — the answer key the agent is graded
-against ([docs/plant.md](docs/plant.md#the-fault-menu--ground-truth-for-agent-week)):
-
-| Fault | rebuffer | bitrate | 4xx | tell |
-| --- | --- | --- | --- | --- |
-| `edge_latency` | 0.44, **one region** | drops, one region | none | regional, not plant-wide |
-| `segment_gap` | ~0.05, all regions | unchanged | **sustained** | packager fault |
-| `ladder_collapse` | **zero** | 3.6 → 2.0 Mbps | transient only | manifest 4 → 3 rungs |
-| `black_source` | zero | unchanged | none | **nothing moves** |
-| `ladder_mismatch` | zero | unchanged | none | **nothing moves** |
-
-The last two are invisible in every metric, log and trace — and that is the
-point. `black_source` shows a black frame with the timecode still running;
-`ladder_mismatch` shows a visibly soft 1080p rung carrying upscaled 720p detail
-at full bitrate. Only frame inspection catches either.
+Before any of the above existed, the first thing built was a bare ADK agent that did nothing but list the Grafana MCP server's tools, to prove a headless agent could authenticate at all. It is still in the repo and still works:
 
 ```bash
-make chaos MODE=black_source
-make chaos MODE=edge_latency REGION=europe-west1
-make chaos-status && make chaos-clear
+cd agents && adk web
 ```
 
-**All three signals are live.** Metrics → Mimir, logs → Loki, traces → Tempo,
-with `traceparent` carried into the origin access log so a log line joins to its
-trace. A captured trace reads *viewer 7.8ms → edge 5.9ms (cache MISS) → origin
-3.5ms* — causality neither metrics nor logs can express, and what the agent's
-Phase 1 fans out across.
+Open the URL it prints, pick the `grafana_probe` agent, and ask it about your stack. The MCP server authenticates with a service-account token — no browser handshake, which is the whole reason it is self-hosted. Grafana's hosted `mcp.grafana.com` endpoint only authenticates through an interactive OAuth 2.1 browser flow, which a headless agent woken by a webhook can never complete.
 
-**Vision spike — the premise holds, with one correction.** Before building the
-agent, the riskiest assumption was tested directly: can Gemini actually see
-these faults? Full results in [docs/vision-spike.md](docs/vision-spike.md).
+This is a connectivity check, not the product. The tools it exposes are catalogued in [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md).
 
-| Fault | Vision | Who decides |
-| --- | --- | --- |
-| `black_source` | **100%, every model and variant** | vision |
-| `ladder_mismatch` | **no model separates it from healthy** | code decides, vision confirms |
+</details>
 
-`black_source` — the fault the whole demo is built around — is detected
-perfectly and never confused with a healthy frame. `ladder_mismatch` is not:
-the flash tiers call everything crisp, `gemini-2.5-pro` calls everything
-upscaled (flagging **9/9 healthy frames** as faulty), and cross-rung pairing
-makes it *worse* because the models confabulate the comparison in fluent,
-confident, exactly-backwards prose.
+---
 
-That fault is trivially measurable in code, though — a downscale/upscale
-round-trip separates the same frames by **10 dB with no overlap**
-([`scripts/rung_resolution_check.py`](scripts/rung_resolution_check.py)). So for
-`ladder_mismatch` the architecture inverts: code decides, vision narrates. Model
-choice is settled at `gemini-3.7-flash`, the only tier with a zero false-positive
-rate on healthy frames.
+## Tech stack
 
-## The agent — all five phases
+| Layer | Choice |
+| --- | --- |
+| Agent framework | Google ADK (`google-adk`) — `SequentialAgent` spine, `ParallelAgent` fan-out |
+| Model | Gemini via Vertex AI (`google-genai`) |
+| Observability | Grafana Cloud — Mimir · Loki · Tempo |
+| MCP server | [grafana/mcp-grafana](https://github.com/grafana/mcp-grafana), self-hosted via Docker |
+| Collector | Grafana Alloy, with a cardinality guard before `remote_write` |
+| Plant | ffmpeg · nginx · Python stdlib services · Docker Compose |
 
-**6/6 correct** across every fault plus a healthy control, through the complete
-five-phase pipeline — scope, see, diagnose, human-gated act, and record with
-verified recovery. Reproduce with `make diagnose-eval`.
+**The agent sees 12 of the 73 MCP tools**, no specialist more than 4. 73 tool declarations measurably degrades function-calling accuracy, and pinning makes the search space a reviewable design decision rather than whatever the server happens to expose that week.
 
-```bash
-make agent REGION=us-east1     # run once
-make agent-watch               # REACTIVE: wake on every firing alert
-make agent-sweep               # PROACTIVE: confidence monitor on a timer
-make agent-tools               # show the pinned MCP subset
-make diagnose-checks           # score all 6 cases, deterministic, no model
-make diagnose-eval             # drive all 6 through the full agent
-make agent-profile             # where a run's time went, from its own traces
-```
+---
 
-**Two triggers, one pipeline.** Reactive (an alert fires) and proactive (a
-scheduled content sweep) both feed the same phases. The sweep is first-class,
-not a fallback: `black_source` moves no metric, so **no alert can ever fire for
-it** — after ten minutes of black, all three alert instances read `Normal`. An
-alert-driven agent sleeps through the fault this project exists to catch.
+## Engineering notes
 
-A confidence monitor that is always watching is also what real broadcast
-operations run, which makes the thesis self-consistent: the agent finds dead air
-*because it is looking*, not because telemetry told it to.
+A few decisions that are easy to get wrong and were settled by measurement rather than argument:
 
-A `SequentialAgent` phase lifecycle with a `ParallelAgent` fan-out inside Phase
-1 — four specialists querying Mimir, Loki, Tempo and dashboards concurrently
-through the self-hosted MCP server, then a synthesiser emitting a
-schema-validated `IncidentScope`. Phase 2 fetches the real segment from the
-affected edge and emits a `VisualFinding`. Details in [docs/agent.md](docs/agent.md).
+- **The burned-in timecode breaks the obvious black detectors.** On a black frame, `YMAX` is pinned to 236 by the white clock — five units off healthy — so any max-luma detector reads a blacked-out channel as fine. `ffmpeg`'s `blackdetect` *does* trip, but only by luck: its `pic_th=0.98` default happens to suit this overlay's size. Mean luma and the 90th percentile are measured directly instead.
+- **Absence is never evidence.** Every absence-based check is gated on the exporter that would have shown the presence, because a dead viewer fleet used to make four required health checks pass on empty results and return `no_fault_detected` at **high** confidence during a live fault.
+- **The plant's answer key never reaches the agent.** `encoder_chaos_active` and `edge_chaos_active` are 1 exactly when a fault is injected. They are dropped at the collector, so they return **0 series** to the agent while staying visible to the operator — not a promise that it does not cheat, a demonstration that it cannot.
+- **Bounds are enforced where they can actually fire.** A single vision call once ran **1831 seconds** and then succeeded; a per-request timeout could not catch it (httpx resets its read timeout on every chunk) and neither could the run ceiling (ADK runs sync tools on the event loop). The deadline now lives in a worker thread.
 
-**The agent sees 12 of the 73 MCP tools**, no specialist more than 4. 73 tool
-declarations degrades function-calling accuracy, and pinning makes the search
-space a reviewable design decision rather than whatever the MCP server happens
-to expose that week.
+A full read-only audit — 30 verified findings, bucketed by severity, with a gap list longer than the findings — is committed at **[docs/audit-2026-08-21.md](docs/audit-2026-08-21.md)**.
 
-**Verified on three different faults:**
-
-| Injected | Phase 1 narrowed to | Phase 2 found | Correct |
-| --- | --- | --- | --- |
-| `black_source` | `black_source`, `ladder_mismatch` | `black_frame`, timecode **advancing** | ✅ |
-| `edge_latency` | `edge_latency` (single region) | pixels healthy, no content fault | ✅ |
-| `ladder_mismatch` | — | vision said **healthy**; code measured ratio **1.199** → `ladder_mismatch` | ✅ |
-
-That last row is the spike's finding paying off. Vision looked straight at the
-upscaled frame and called it healthy at confidence 1.0 — and the agent still
-got the right answer, because resolution is decided by
-[`check_rung_resolution`](scripts/rung_resolution_check.py) and vision is never
-asked. The rung check is content-independent: it compares the 1080p rung's
-downscale round-trip against the 720p rung's from the same stream, so the ratio
-carries the signal and no `testsrc2` calibration is baked in.
-
-**Phase 3 — DIAGNOSE.** Gemini ranks which hypotheses are worth testing; **code
-runs the confirming checks and computes the verdict; evidence decides.**
-[`signatures.py`](agents/dead_air/signatures.py) encodes §5's five faults as
-deterministic predicates that reproduce the table measured by
-[`fault_signatures.py`](scripts/fault_signatures.py) — that harness stays the
-ground truth. Verified **6/6** on the live plant: all five faults plus a healthy
-control.
-
-The `ladder_collapse` vs `segment_gap` discriminator is computed, not reasoned
-about. Both produce 404s, so presence separates nothing — persistence does:
-
-| `fourxx_status` | Meaning | Fault |
-| --- | --- | --- |
-| `ongoing` | segments still being deleted | `segment_gap` |
-| `stopped` | burst died out as players re-read the manifest | `ladder_collapse` |
-
-And missing evidence is never elimination: a fault whose required checks cannot
-be evaluated is **`unconfirmable`**, kept in a separate field from `ruled_out`.
-Conflating the two is how an agent reports false certainty.
-
-**Step 5 — cloud deployment (not started).** GCE origin, then three Cloud Run
-edges. Nothing is blocked on it — all four layers run locally today.
-
-### Everything stays local until it has to move
-
-The plant runs entirely on Docker today. That is not just cost control: an edge
-in `europe-west1` needs a publicly reachable origin, so deploying L2 to Cloud
-Run silently requires L1 on GCE first. Local has no such ordering constraint,
-which makes it the cheaper place to be wrong.
+---
 
 ## Documentation
 
 | | |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | **start here** — the whole system in one diagram, and what is decided by code rather than by the model |
-| [docs/demo-runbook.md](docs/demo-runbook.md) | how to drive the demo, with measured timings for every beat |
-| [docs/plant.md](docs/plant.md) | the simulated broadcast plant, and the fault menu with measured signatures |
-| [docs/agent.md](docs/agent.md) | the five-phase agent, and why the sweep exists |
-| [docs/content-screen.md](docs/content-screen.md) | Stage 0's calibration, and the burned-in-timecode trap |
-| [docs/agent-performance.md](docs/agent-performance.md) | where the time and the tokens actually go |
+| [docs/architecture.md](docs/architecture.md) | **start here** — the whole system in one diagram, and what is decided by code |
+| [docs/demo-runbook.md](docs/demo-runbook.md) | how to drive it, with measured timings for every beat |
+| [docs/plant.md](docs/plant.md) | the simulated plant and the fault menu with measured signatures |
+| [docs/agent.md](docs/agent.md) | the five phases, and why the sweep exists |
+| [docs/content-screen.md](docs/content-screen.md) | Stage 0's calibration and the burned-in-timecode trap |
 | [docs/vision-spike.md](docs/vision-spike.md) | what vision can and cannot see, measured per model tier |
-| [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md) | cloud steps 1 and 2, executed and measured |
-| [docs/audit-2026-08-21.md](docs/audit-2026-08-21.md) | a full read-only audit: 30 verified findings, and an honest list of what was **not** verified |
+| [docs/agent-performance.md](docs/agent-performance.md) | where the time and the tokens actually go |
+| [docs/cloud-deployment-risk.md](docs/cloud-deployment-risk.md) | cloud steps 1 and 2, executed, measured and torn down |
+| [docs/audit-2026-08-21.md](docs/audit-2026-08-21.md) | 30 verified findings, and an honest list of what was **not** verified |
 | [docs/mcp-tool-inventory.md](docs/mcp-tool-inventory.md) | which Grafana MCP tools each specialist is pinned to |
+
+---
+
+## Roadmap
+
+The local plant and the full five-phase agent run today. Beyond that:
+
+- **Move the viewer fleet into GCP.** Cloud steps 1 and 2 are executed and measured — a GCE origin and three Cloud Run edges — but a hybrid topology (cloud edges, local viewers) puts every region above its own TTFB threshold and pins the furthest to the bottom ABR rung. That is the WAN, not the plant, and it makes regional numbers meaningless until the fleet moves.
+- **A stable public endpoint**, so the agent runs on the webhook rather than a laptop and ngrok.
+- **Freeze detection as a first-class fault.** `freezedetect` already runs in the same Stage 0 pass; the plant does not yet inject a frozen source to grade it against.
+- **More content faults** — colour bars, slate, audio silence over good video — each needing its own deterministic screen before a model is ever asked.
+- **Real telemetry.** The plant is synthetic by design; the agent's Grafana queries are not, and would point at a real stack unchanged.
+
+---
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache 2.0](LICENSE)
